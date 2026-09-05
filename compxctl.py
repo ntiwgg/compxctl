@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""compxctl.py — set or measure the polling rate of a CompX / Ardor Gaming
-mouse and probe (read back) its config memory.
+"""compxctl.py — control a CompX / Ardor Gaming mouse: set the polling
+rate, snapshot the device state (`status`), read the battery (`battery`),
+measure the real rate (`check`) and probe (read back) its config memory.
 
 The proprietary control protocol lives below — the packet table and report
 order for `set` in POLLING_VARIANTS, the config-memory read framing for
-`probe` in the PROBE_* section — this file is the single source of truth.
+`probe` in the PROBE_* section, the battery request for `status`/`battery`
+in _build_battery_request() — this file is the single source of truth.
 
 Architecture — two transports talk to the same config interface
 (interface 1), layered under one protocol and one set of commands:
@@ -12,7 +14,7 @@ Architecture — two transports talk to the same config interface
 * pyusb (raw USB) — always works, because it needs no kernel driver on the
   interface. `probe` reads through it alone (a SET_REPORT read command,
   the reply picked off the interrupt-IN endpoint); `set` delivers every
-  rate packet through it.
+  rate packet through it; `status` and `battery` read their state with it.
 * hidapi / raw hidraw ioctls — used by `set` as an extra delivery channel
   per packet, but only while the kernel exposes the config interface as a
   hidraw node (usage pages FF01-FF04). CompX mice may ship with interface 1
@@ -33,7 +35,7 @@ import threading
 import time
 from pathlib import Path
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 VENDOR_ID = 0x25A7
 PRODUCT_IDS = (0xFA7B, 0xFA7C, 0xFA03, 0xFA93)
@@ -121,16 +123,26 @@ INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
 #     echo the command and the whole frame must sum to 0x55 again. The
 #     firmware refuses LN > 10 (status 0x01 + zeroes), so reads stay ≤ 10.
 # Register map of the config memory (probe prints bytes and interprets only
-# what is confirmed):
+# what is confirmed; status/battery read the same fields as named readouts):
 #   0x0000           polling-rate code + complement (01 54 = 1000 Hz)
+#   0x0004           active DPI level index + complement at 0x0005
+#                    (observed 01..03; the index is 1-based, see
+#                    ACTIVE_LEVEL_OFFSET — pending calibration)
 #   0x000C..0x002B   DPI slots, 4 bytes each (x, y, mul, per-slot checksum);
-#                    slot checksum = 0x55 − x − y − mul (observed 13 13 00 2f)
+#                    slot checksum = 0x55 − x − y − mul (observed 13 13 00 2f);
+#                    DPI = (x + 1) × 50 for x ≤ 0x7F and mul = 0 (dpi_decode)
 #   0x0060..0x009F   button matrix, ~0x00A0 LED; past 0x00A0 the memory is
 #                    empty 0xFF.
 PROBE_BLOCK_BYTES = 8  # bytes read per probe dump line
 PROBE_MAX_READ_BYTES = 10  # firmware ceiling for one read command (LN)
 PROBE_FRAME_BYTES = 17  # fixed size of the command and reply frames
 PROBE_READ_TIMEOUT_MS = 500  # interrupt-IN reply deadline
+# Reads retry after receiving a frame that fails verification: `set` bursts
+# leave the firmware's write acks (09 07 ...) queued on the interrupt-IN
+# endpoint, and each failed read drains exactly one such stale frame, so
+# the retry usually sees the true reply. Timeouts are NOT retried (a late
+# reply must not be doubled), so a hung device still fails fast.
+READ_ATTEMPTS = 4
 PROBE_MAX_DUMP_BYTES = 0x100  # `probe --length` ceiling
 PROBE_POLLING_ADDR = 0x0000
 PROBE_POLLING_HZ_BY_CODE: dict[int, int] = {
@@ -142,6 +154,19 @@ PROBE_POLLING_HZ_BY_CODE: dict[int, int] = {
 PROBE_DPI_TABLE_START = 0x000C
 PROBE_DPI_TABLE_END = 0x002C  # exclusive
 PROBE_DPI_SLOT_BYTES = 4
+
+# Status readouts (v1.1.0) — register addresses and battery framing
+# confirmed on hardware (a FA7B 2.4G dual-mode mouse).
+ACTIVE_DPI_LEVEL_ADDR = 0x0004  # 1 byte level index, complement at +1
+# The level register counts DPI levels 1..8 while the slot rows below are
+# 0-based, so the active slot is (level − offset); exact firmware meaning
+# still pending calibration.
+ACTIVE_LEVEL_OFFSET = 1
+# Battery reply echo: the 08 04 request comes back as 09 04 ... with
+# reply[5] = link state, reply[6] = percent, reply[7] = charging flag.
+# Observed on hardware: 09 04 00 00 00 02 64 00 -> 100%, not charging.
+BATTERY_REPLY_ECHO = b"\x09\x04"
+BATTERY_STATE_LABELS: dict[int, str] = {0x02: "2.4G mode"}
 
 
 # ==========================================================================
@@ -162,6 +187,27 @@ def _verify_frame(frame: bytes) -> bool:
     """True when `frame` sums to ≡ 0x55 (mod 256) — the identity every
     CompX config frame (write, read command and read reply) must satisfy."""
     return (sum(frame) & 0xFF) == 0x55
+
+
+def dpi_code(dpi: int) -> int | None:
+    """Encode a DPI value into the slot code the mouse stores: the stored
+    code is (dpi / 50) − 1, so 400 → 0x07 … 6400 → 0x7F. Returns None when
+    `dpi` cannot be represented (not a multiple of 50, or beyond 0x7F)."""
+    if dpi % 50 != 0:
+        return None
+    code = dpi // 50 - 1
+    if not 0 <= code <= 0x7F:
+        return None
+    return code
+
+
+def dpi_decode(code: int, mul: int = 0) -> int | None:
+    """Decode one DPI slot code: (code + 1) × 50 for code ≤ 0x7F and
+    mul = 0. Extended encoding (code > 0x7F or mul ≠ 0) is not understood
+    yet, so it decodes to None and the caller shows the raw bytes."""
+    if mul != 0 or not 0 <= code <= 0x7F:
+        return None
+    return (code + 1) * 50
 
 
 def _build_write_frame(addr: int, data: bytes) -> bytes:
@@ -204,6 +250,20 @@ def _build_read_frame(addr: int, length: int) -> bytes:
     return body + bytes((_compx_checksum(body),))
 
 
+def _build_battery_request() -> bytes:
+    """Assemble the 17-byte battery-state request frame.
+
+    Layout: 08 04 + fourteen 0x00 pad bytes + checksum tail (the same
+    0x55-identity tail as every config frame). The firmware echoes 09 04
+    on the interrupt-IN endpoint; read_battery() verifies and parses that
+    reply. Delivered as an output SET_REPORT (report_type 0x02), which the
+    FA7B firmware answers — as with the 0x08 read command, it dispatches on
+    the payload, not the report type.
+    """
+    body = b"\x08\x04" + b"\x00" * (PROBE_FRAME_BYTES - 3)  # 16 leading bytes
+    return body + bytes((_compx_checksum(body),))
+
+
 def _parse_read_reply(reply: bytes) -> bytes:
     """Extract the payload of a config-memory read reply.
 
@@ -242,6 +302,12 @@ _KNOWN_GOOD_EEPROM_PACKETS: dict[int, bytes] = {
     1000: b"\x08\x07\x00\x00\x00\x06\x01\x54\x01\x54\x00\x55\x00\x00\x00\x00\x41",
 }
 
+# Byte-identity reference for _verify_battery_request(): the 08 04 request
+# as captured from a real mouse. The builder above must reproduce it exactly.
+_KNOWN_GOOD_BATTERY_REQUEST: bytes = (
+    b"\x08\x04" + b"\x00" * 14 + b"\x49"
+)
+
 
 def _verify_packet_generation() -> None:
     """Assert the built EEPROM packets match the known-good captures.
@@ -260,6 +326,53 @@ def _verify_packet_generation() -> None:
             raise AssertionError(
                 f"EEPROM packet for {rate} Hz violates the 0x55 checksum identity"
             )
+
+
+def _verify_battery_request() -> None:
+    """Assert the built battery request matches the known-good capture.
+
+    Runs only when COMPX_SELFCHECK=1 (see main()); raises AssertionError on
+    any drift in the request framing.
+    """
+    built = _build_battery_request()
+    if built != _KNOWN_GOOD_BATTERY_REQUEST:
+        raise AssertionError(
+            f"Battery request drift: built {built.hex(' ')} "
+            f"!= known-good {_KNOWN_GOOD_BATTERY_REQUEST.hex(' ')}"
+        )
+    if (sum(built) & 0xFF) != 0x55:
+        raise AssertionError(
+            "Battery request violates the 0x55 checksum identity"
+        )
+
+
+# DPI-codec round-trips confirmed on hardware: the stored code is
+# (dpi / 50) − 1, so 400 → 0x07 … 6400 → 0x7F (see dpi_code/dpi_decode).
+_DPI_CODEC_ROUND_TRIPS: tuple[tuple[int, int], ...] = (
+    (400, 0x07),
+    (800, 0x0F),
+    (1600, 0x1F),
+    (2400, 0x2F),
+    (6400, 0x7F),
+)
+
+
+def _verify_dpi_codec() -> None:
+    """Assert dpi_code/dpi_decode round-trip every known-good DPI pair.
+
+    Runs only when COMPX_SELFCHECK=1 (see main()); raises AssertionError on
+    any drift, and also asserts the not-yet-understood encodings decode to
+    None instead of a wrong number.
+    """
+    for dpi, code in _DPI_CODEC_ROUND_TRIPS:
+        if dpi_code(dpi) != code:
+            raise AssertionError(f"dpi_code({dpi}) != 0x{code:02X}")
+        if dpi_decode(code) != dpi:
+            raise AssertionError(f"dpi_decode(0x{code:02X}) != {dpi}")
+    if dpi_decode(0x80) is not None:
+        raise AssertionError("dpi_decode accepted a code above 0x7F")
+    if dpi_decode(0x7B, mul=0x44) is not None:
+        raise AssertionError("dpi_decode accepted an extended (mul ≠ 0) slot")
 
 
 POLLING_VARIANTS: dict[int, tuple[bytes, ...]] = {
@@ -575,48 +688,59 @@ def read_config_register(addr: int, length: int) -> bytes:
 
     Sends the read frame as a feature SET_REPORT and picks the reply off the
     interrupt-IN endpoint. The reply echoes AH/AL/LN and must sum to 0x55,
-    so both are verified before the payload is trusted. Errors surface as
-    RuntimeError with the failing address attached.
+    so both are verified before the payload is trusted. A received frame
+    that fails verification was probably a stale write-ack queued by a
+    recent `set` burst — it is drained by this read, so the read is retried
+    (READ_ATTEMPTS times) before raising RuntimeError with the failing
+    address attached. Timeouts and transport errors are not retried.
     """
     command = _build_read_frame(addr, length)
-    try:
-        _usb_send_report(command, report_type=0x03)  # feature report 0x0308
-    except OSError as exc:
-        raise RuntimeError(
-            f"USB SET_REPORT failed while reading config memory at "
-            f"0x{addr:04X}: {exc}"
-        ) from exc
+    last_detail = f"No config-memory reply from the device for 0x{addr:04X}"
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            _usb_send_report(command, report_type=0x03)  # feature report 0x0308
+        except OSError as exc:
+            raise RuntimeError(
+                f"USB SET_REPORT failed while reading config memory at "
+                f"0x{addr:04X}: {exc}"
+            ) from exc
 
-    try:
-        reply = _usb_read_reply()
-    except OSError as exc:
-        raise RuntimeError(
-            f"No config-memory reply from the device for 0x{addr:04X} "
-            f"(interrupt-IN read: {exc})"
-        ) from exc
-    if reply is None:
-        raise RuntimeError(
-            f"No config-memory reply from the device for 0x{addr:04X} "
-            f"(interrupt-IN read timed out)"
-        )
-
-    if len(reply) != PROBE_FRAME_BYTES:
-        raise RuntimeError(
-            f"Short config-memory reply for 0x{addr:04X}: got "
-            f"{len(reply)} bytes, expected {PROBE_FRAME_BYTES}"
-        )
-    if reply[3:6] != command[3:6]:
-        raise RuntimeError(
-            f"Config-memory reply header mismatch for 0x{addr:04X}: "
-            f"echo AH/AL/LN = {reply[3:6].hex(' ')} "
-            f"(expected {command[3:6].hex(' ')}) — stale reply?"
-        )
-    if not _verify_frame(reply):
-        raise RuntimeError(
-            f"Config-memory reply checksum mismatch for 0x{addr:04X}: "
-            "frame does not sum to 0x55"
-        )
-    return _parse_read_reply(reply)
+        try:
+            reply = _usb_read_reply()
+        except OSError as exc:
+            raise RuntimeError(
+                f"No config-memory reply from the device for 0x{addr:04X} "
+                f"(interrupt-IN read: {exc})"
+            ) from exc
+        if reply is None:
+            raise RuntimeError(
+                f"No config-memory reply from the device for 0x{addr:04X} "
+                f"(interrupt-IN read timed out)"
+            )
+        if len(reply) != PROBE_FRAME_BYTES:
+            last_detail = (
+                f"Short config-memory reply for 0x{addr:04X}: got "
+                f"{len(reply)} bytes, expected {PROBE_FRAME_BYTES}"
+            )
+            continue
+        if reply[3:6] != command[3:6]:
+            last_detail = (
+                f"Config-memory reply header mismatch for 0x{addr:04X}: "
+                f"echo AH/AL/LN = {reply[3:6].hex(' ')} "
+                f"(expected {command[3:6].hex(' ')}) — stale reply?"
+            )
+            continue
+        if not _verify_frame(reply):
+            last_detail = (
+                f"Config-memory reply checksum mismatch for 0x{addr:04X}: "
+                "frame does not sum to 0x55"
+            )
+            continue
+        return _parse_read_reply(reply)
+    raise RuntimeError(
+        f"{last_detail} (retried {READ_ATTEMPTS} times after stale frames; "
+        "is another program writing to the mouse?)"
+    )
 
 
 def write_config(addr: int, data: bytes) -> None:
@@ -635,6 +759,111 @@ def write_config(addr: int, data: bytes) -> None:
             f"USB SET_REPORT failed while writing config memory at "
             f"0x{addr:04X}: {exc}"
         ) from exc
+
+
+def read_polling_rate_hz() -> int | None:
+    """Read the polling-rate code at 0x0000 and map it to Hz.
+
+    None means the code is not in the known map (PROBE_POLLING_HZ_BY_CODE);
+    transport failures still raise RuntimeError with the failing register
+    attached, as read_config_register() does.
+    """
+    code = read_config_register(PROBE_POLLING_ADDR, 1)[0]
+    return PROBE_POLLING_HZ_BY_CODE.get(code)
+
+
+def read_active_dpi_level() -> tuple[int, int] | None:
+    """Read the active DPI level marker: (raw index, raw complement).
+
+    The index byte lives at 0x0004, its complement at 0x0005. Returns None
+    only when the pair is unset (0xFF 0xFF). No offset interpretation
+    happens here — the caller maps the index to a slot row (see
+    ACTIVE_LEVEL_OFFSET), so the raw bytes stay available for display.
+    """
+    data = read_config_register(ACTIVE_DPI_LEVEL_ADDR, 2)
+    if data == b"\xff\xff":
+        return None
+    return data[0], data[1]
+
+
+def read_dpi_slots() -> list[dict]:
+    """Read the eight DPI slot rows (4 bytes each) from 0x000C onward.
+
+    Two rows are fetched per read command (PROBE_BLOCK_BYTES = 8). Every
+    row comes back as a dict {index, addr, x, y, mul, crc_ok, dpi}, where
+    crc_ok is the slot checksum identity ((x + y + mul + crc) ≡ 0x55) and
+    dpi is dpi_decode(x, mul) — or None for empty, bad-checksum or
+    extended-encoding rows, which the caller displays as raw bytes.
+    """
+    table_bytes = PROBE_DPI_TABLE_END - PROBE_DPI_TABLE_START
+    slots: list[dict] = []
+    for offset in range(0, table_bytes, PROBE_BLOCK_BYTES):
+        data = read_config_register(PROBE_DPI_TABLE_START + offset, PROBE_BLOCK_BYTES)
+        for local in range(0, PROBE_BLOCK_BYTES, PROBE_DPI_SLOT_BYTES):
+            row = data[local : local + PROBE_DPI_SLOT_BYTES]
+            x, y, mul, crc = row
+            addr = PROBE_DPI_TABLE_START + offset + local
+            crc_ok = (x + y + mul + crc) & 0xFF == 0x55
+            dpi = None if row == b"\xff" * PROBE_DPI_SLOT_BYTES else dpi_decode(x, mul)
+            slots.append(
+                {
+                    "index": (addr - PROBE_DPI_TABLE_START) // PROBE_DPI_SLOT_BYTES,
+                    "addr": addr,
+                    "x": x,
+                    "y": y,
+                    "mul": mul,
+                    "crc": crc,
+                    "crc_ok": crc_ok,
+                    "dpi": dpi,
+                }
+            )
+    return slots
+
+
+def read_battery() -> tuple[int, bool, int]:
+    """Read the battery state: returns (percent, charging, state).
+
+    Sends the 17-byte 08 04 battery request (_build_battery_request()) as
+    an output SET_REPORT and picks the 09 04 echo reply off the
+    interrupt-IN endpoint (reply[5] = link state, reply[6] = percent,
+    reply[7] = charging flag). A received frame that fails verification was
+    probably a stale write-ack queued by a recent `set` burst — it is
+    drained by this read, so the request is retried (READ_ATTEMPTS times)
+    before RuntimeError is raised. Timeouts ("no battery reply") are not
+    retried: a late reply must not be doubled.
+    """
+    last_detail = "no battery reply"
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            _usb_send_report(_build_battery_request())
+        except OSError as exc:
+            raise RuntimeError(
+                f"USB SET_REPORT failed while requesting the battery state: {exc}"
+            ) from exc
+
+        try:
+            reply = _usb_read_reply(timeout=PROBE_READ_TIMEOUT_MS)
+        except OSError as exc:
+            raise RuntimeError(f"Battery reply could not be read: {exc}") from exc
+        if reply is None:
+            raise RuntimeError("no battery reply")
+        if len(reply) != PROBE_FRAME_BYTES:
+            last_detail = "no battery reply"
+            continue
+        if reply[:2] != BATTERY_REPLY_ECHO:
+            last_detail = (
+                f"Battery reply header mismatch: {reply[:2].hex(' ')} != "
+                f"{BATTERY_REPLY_ECHO.hex(' ')} — stale reply?"
+            )
+            continue
+        if not _verify_frame(reply):
+            last_detail = "Battery reply checksum mismatch: frame does not sum to 0x55"
+            continue
+        return reply[6], bool(reply[7]), reply[5]
+    raise RuntimeError(
+        f"{last_detail} (retried {READ_ATTEMPTS} times after stale frames; "
+        "is another program writing to the mouse?)"
+    )
 
 
 def _format_hid_error(exc: BaseException) -> str:
@@ -806,8 +1035,151 @@ def measure_event_rate_hz(event_path: str, seconds: float = MEASURE_SECONDS) -> 
 
 
 # ==========================================================================
-# Commands — CLI entry points; behaviour and output are frozen by v1.0.1.
+# Commands — CLI entry points. The behaviour and output of the v1.0.1
+# commands (set/check/probe) are frozen; `status` and `battery` were added
+# in v1.1.0 and are strictly read-only.
 # ==========================================================================
+
+
+def _slot_value_text(slot: dict) -> str:
+    """Compact human text for one DPI slot row's stored value.
+
+    Decoded rows print the DPI ("400"), rows in the not-yet-understood
+    extended encoding print the raw code (with mul when it is the cause:
+    "raw:0x7B(mul=0x44)"), and an unset row prints "empty".
+    """
+    if (slot["x"], slot["y"], slot["mul"], slot["crc"]) == (0xFF,) * 4:
+        return "empty"
+    if slot["dpi"] is not None:
+        return str(slot["dpi"])
+    if slot["mul"]:
+        return f"raw:0x{slot['x']:02X}(mul=0x{slot['mul']:02X})"
+    return f"raw:0x{slot['x']:02X}"
+
+
+def _battery_text(percent: int, charging: bool, state: int) -> str:
+    """One-line battery readout: "Battery: 100% (not charging) [2.4G mode]".
+    The bracketed link label is appended only for known states (see
+    BATTERY_STATE_LABELS)."""
+    text = f"Battery: {percent}% ({'charging' if charging else 'not charging'})"
+    label = BATTERY_STATE_LABELS.get(state)
+    if label is not None:
+        text += f" [{label}]"
+    return text
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """`status` entry point: read-only device snapshot.
+
+    Every field is read in its own short raw-USB session (claim +
+    detach/re-attach, a few ms each — acceptable for a one-shot readout).
+    A failing field degrades to "n/a" with a warning on stderr instead of
+    failing the snapshot; only a missing device — or one from which nothing
+    could be read at all — exits non-zero.
+    """
+    try:
+        pid = get_active_product_id()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    if pid is None:
+        print(f"Error: {DEVICE_NOT_FOUND_TEXT}", file=sys.stderr)
+        return 1
+
+    warnings: list[str] = []
+    ok_fields = 0
+
+    def warn(field: str, exc: BaseException) -> None:
+        warnings.append(f"{field}: {exc}")
+
+    battery_text = "Battery: n/a"
+    try:
+        percent, charging, state = read_battery()
+    except RuntimeError as exc:
+        warn("battery", exc)
+    else:
+        battery_text = _battery_text(percent, charging, state)
+        ok_fields += 1
+
+    polling_text = "n/a"
+    try:
+        hz = read_polling_rate_hz()
+    except RuntimeError as exc:
+        warn("polling rate", exc)
+    else:
+        ok_fields += 1
+        if hz is not None:
+            polling_text = f"{hz} Hz (register 0x{PROBE_POLLING_ADDR:04X})"
+        else:
+            polling_text = f"unknown code (register 0x{PROBE_POLLING_ADDR:04X})"
+
+    dpi_slots: list[dict] | None = None
+    try:
+        dpi_slots = read_dpi_slots()
+    except RuntimeError as exc:
+        warn("DPI slots", exc)
+    else:
+        ok_fields += 1
+
+    active_pair: tuple[int, int] | None = None
+    try:
+        active_pair = read_active_dpi_level()
+    except RuntimeError as exc:
+        warn("active DPI level", exc)
+    else:
+        if active_pair is not None:
+            ok_fields += 1
+
+    print(f"Device: CompX mouse (PID 0x{pid:04x})")
+    print(f"Polling rate: {polling_text}")
+    active_text = "n/a (register 0x0004 unset)"
+    if active_pair is not None:
+        index = active_pair[0]
+        active_text = f"index 0x{index:02X} (register 0x{ACTIVE_DPI_LEVEL_ADDR:04X})"
+        if index == 0:
+            active_text += (
+                " → no level marked (the `set` EEPROM write spans registers "
+                "0x0000..0x0005 and clears this one)"
+            )
+        else:
+            slot_index = index - ACTIVE_LEVEL_OFFSET
+            if dpi_slots is not None and 0 <= slot_index < len(dpi_slots):
+                active_text += (
+                    f" → slot [{slot_index}]: {_slot_value_text(dpi_slots[slot_index])}"
+                )
+            else:
+                active_text += (
+                    " → no matching DPI slot (level numbering assumed 1-based, "
+                    "ACTIVE_LEVEL_OFFSET — pending calibration)"
+                )
+    print(f"Active DPI level: {active_text}")
+
+    if dpi_slots is not None:
+        entries = [f"[{slot['index']}] {_slot_value_text(slot)}" for slot in dpi_slots]
+        if active_pair is not None and active_pair[0] != 0:
+            slot_index = active_pair[0] - ACTIVE_LEVEL_OFFSET
+            if 0 <= slot_index < len(entries):
+                entries[slot_index] += " ← active"
+        print("DPI slots: " + " ".join(entries))
+    else:
+        print("DPI slots: n/a")
+
+    print(battery_text)
+
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0 if ok_fields else 1
+
+
+def cmd_battery(args: argparse.Namespace) -> int:
+    """`battery` entry point: read the battery level and charging state."""
+    try:
+        percent, charging, state = read_battery()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(_battery_text(percent, charging, state))
+    return 0
 
 
 def cmd_set(args: argparse.Namespace) -> int:
@@ -933,12 +1305,31 @@ def cmd_probe(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="compxctl",
-        description="Set or measure the polling rate of a CompX / Ardor Gaming "
-                    "mouse (VID 0x25A7).",
+        description="Set polling rate and DPI, measure and read battery of "
+                    "CompX / Ardor Gaming mice (VID 0x25A7).",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
-    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+    # No required subcommand: a bare `compxctl` runs `status` (see main()).
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="print a read-only device snapshot (rate, DPI levels, battery)",
+        description="Print a read-only snapshot of the CompX mouse: product id, "
+                    "polling rate, active DPI level, the eight DPI slot rows and "
+                    "the battery state (raw USB, requires pyusb).",
+    )
+    status_parser.set_defaults(func=cmd_status)
+
+    battery_parser = subparsers.add_parser(
+        "battery",
+        help="read the battery level and charging state",
+        description="Read the battery state of the CompX mouse over raw USB "
+                    "(requires pyusb). Read-only: prints percent, charging flag "
+                    "and, when known, the link mode.",
+    )
+    battery_parser.set_defaults(func=cmd_battery)
 
     set_parser = subparsers.add_parser(
         "set",
@@ -997,10 +1388,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     if os.environ.get("COMPX_SELFCHECK") == "1":
         _verify_packet_generation()
+        _verify_battery_request()
+        _verify_dpi_codec()
     parser = build_parser()
     args = parser.parse_args(argv)
+    # A bare `compxctl` (no subcommand) means `status`.
+    func = args.func if getattr(args, "func", None) else cmd_status
     try:
-        return args.func(args)
+        return func(args)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
