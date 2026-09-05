@@ -1,0 +1,6 @@
+# CompX / Ardor Gaming mice — VID 25a7, PIDs: fa7b (wired), fa7c (dongle), fa03, fa93.
+# TAG+="uaccess" grants access to the active logind session (no group needed);
+# GROUP/MODE stay as a fallback for setups without logind (e.g. SSH, old distros).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", MODE="0660", GROUP="users", TAG+="uaccess"
+SUBSYSTEM=="input", ATTRS{idVendor}=="25a7", MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", MODE="0664", GROUP="users"

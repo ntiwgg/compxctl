@@ -1,0 +1,6 @@
+# HID transport for `set`: device discovery + feature/output reports
+hidapi
+# USB fallback transport for `set`: direct SET_REPORT via libusb
+pyusb
+# Input-event counting for `check` (only needed for the check command)
+evdev
