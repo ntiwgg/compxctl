@@ -71,22 +71,91 @@ EVENT_NOT_FOUND_TEXT = (
 #      byte 6 = report interval in ms (0x08 -> 125 Hz, 0x02 -> 500 Hz,
 #      0x01 -> 1000 Hz);
 #   3. report 0x08 / sub-report 0x07 (0x08 0x07 ...): EEPROM write of the same
-#      interval (byte 6) so the rate survives unplug / re-plug.
+#      interval so the rate survives unplug / re-plug. The write stores the
+#      interval as the report-interval code (in ms) and ends in a checksum
+#      byte, so it is assembled by _eeprom_packet(), never hardcoded.
+# The EEPROM write stores the rate as the report-interval code of packet 2's
+# byte 6 (value in ms): 1 ms = 1000 Hz, 2 ms = 500 Hz, 8 ms = 125 Hz.
+INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
+
+# CompX config-memory (EEPROM) write packet, 17 bytes:
+#   [0:2]  0x08 0x07       report 0x08, config-memory write opcode 0x07
+#   [2:4]  0x00 0x00       write address 0x0000
+#   [4:6]  0x00 0x06       payload length 0x0006 (six bytes follow)
+#   [6]    rate byte       interval code: 0x01 = 1000 Hz, 0x02 = 500 Hz,
+#                          0x08 = 125 Hz (same convention as packet 2, byte 6)
+#   [7]    complement      additive complement to 0x55 (0x55 - rate byte)
+#   [8:16] observed fields, fixed across rates (01 54 00 55 00 00 00 00)
+#   [16]   checksum        tail byte such that the sum of all 17 bytes is
+#                          ≡ 0x55 (mod 256) — computed, not hardcoded.
+
+
+def _compx_checksum(packet: bytes) -> int:
+    """CompX config-memory write packets: sum of all 17 bytes ≡ 0x55 (mod 256)."""
+    return (0x55 - sum(packet[:-1])) & 0xFF
+
+
+def _eeprom_packet(rate_code: int) -> bytes:
+    """Assemble the 17-byte EEPROM write packet for `rate_code`.
+
+    `rate_code` is the report-interval code the write stores (see
+    INTERVAL_CODE_BY_RATE); the trailing checksum is derived from the sixteen
+    leading bytes so the tail can never drift out of sync with the payload.
+    """
+    prefix = (
+        b"\x08\x07"  # report 0x08, write opcode 0x07
+        b"\x00\x00"  # address 0x0000
+        b"\x00\x06"  # length 0x0006
+        + bytes((rate_code, 0x55 - rate_code))  # rate byte + complement
+        + b"\x01\x54\x00\x55\x00\x00\x00\x00"  # observed fields (fixed)
+    )
+    return prefix + bytes((_compx_checksum(prefix + b"\x00"),))
+
+
+# Byte-identity reference for _verify_packet_generation(): the packets below
+# were captured from a real mouse while compxctl still carried them as
+# literals (v1.0.1 and earlier). The builder above must reproduce them exactly.
+_KNOWN_GOOD_EEPROM_PACKETS: dict[int, bytes] = {
+    125: b"\x08\x07\x00\x00\x00\x06\x08\x4d\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+    500: b"\x08\x07\x00\x00\x00\x06\x02\x53\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+    1000: b"\x08\x07\x00\x00\x00\x06\x01\x54\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+}
+
+
+def _verify_packet_generation() -> None:
+    """Assert the built EEPROM packets match the known-good captures.
+
+    Runs only when COMPX_SELFCHECK=1 (see main()); raises AssertionError on
+    any drift so a regression in packet assembly fails fast and loud.
+    """
+    for rate, known_good in _KNOWN_GOOD_EEPROM_PACKETS.items():
+        built = _eeprom_packet(INTERVAL_CODE_BY_RATE[rate])
+        if built != known_good:
+            raise AssertionError(
+                f"EEPROM packet drift for {rate} Hz: built {built.hex(' ')} "
+                f"!= known-good {known_good.hex(' ')}"
+            )
+        if (sum(built) & 0xFF) != 0x55:
+            raise AssertionError(
+                f"EEPROM packet for {rate} Hz violates the 0x55 checksum identity"
+            )
+
+
 POLLING_VARIANTS: dict[int, tuple[bytes, ...]] = {
     125: (
         b"\x06\x11\x00\x00\x00\x00\x00\x00",
         b"\x08\x11\x00\x00\x00\x06\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        b"\x08\x07\x00\x00\x00\x06\x08\x4d\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+        _eeprom_packet(INTERVAL_CODE_BY_RATE[125]),
     ),
     500: (
         b"\x06\x11\x00\x01\x00\x00\x00\x00",
         b"\x08\x11\x00\x00\x00\x06\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        b"\x08\x07\x00\x00\x00\x06\x02\x53\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+        _eeprom_packet(INTERVAL_CODE_BY_RATE[500]),
     ),
     1000: (
         b"\x06\x11\x00\x02\x00\x00\x00\x00",
         b"\x08\x11\x00\x00\x00\x06\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        b"\x08\x07\x00\x00\x00\x06\x01\x54\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+        _eeprom_packet(INTERVAL_CODE_BY_RATE[1000]),
     ),
 }
 
@@ -521,6 +590,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.environ.get("COMPX_SELFCHECK") == "1":
+        _verify_packet_generation()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
