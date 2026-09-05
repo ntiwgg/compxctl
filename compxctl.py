@@ -5,12 +5,26 @@ mouse and probe (read back) its config memory.
 The proprietary control protocol lives below — the packet table and report
 order for `set` in POLLING_VARIANTS, the config-memory read framing for
 `probe` in the PROBE_* section — this file is the single source of truth.
+
+Architecture — two transports talk to the same config interface
+(interface 1), layered under one protocol and one set of commands:
+
+* pyusb (raw USB) — always works, because it needs no kernel driver on the
+  interface. `probe` reads through it alone (a SET_REPORT read command,
+  the reply picked off the interrupt-IN endpoint); `set` delivers every
+  rate packet through it.
+* hidapi / raw hidraw ioctls — used by `set` as an extra delivery channel
+  per packet, but only while the kernel exposes the config interface as a
+  hidraw node (usage pages FF01-FF04). CompX mice may ship with interface 1
+  unbound and no such node at all, so nothing here requires it; the pyusb
+  path exists precisely for that case.
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import glob
 import os
@@ -81,20 +95,23 @@ EVENT_NOT_FOUND_TEXT = (
 # byte 6 (value in ms): 1 ms = 1000 Hz, 2 ms = 500 Hz, 8 ms = 125 Hz.
 INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
 
-# CompX config-memory (EEPROM) write packet, 17 bytes:
-#   [0:2]  0x08 0x07       report 0x08, config-memory write opcode 0x07
-#   [2:4]  0x00 0x00       write address 0x0000
-#   [4:6]  0x00 0x06       payload length 0x0006 (six bytes follow)
-#   [6]    rate byte       interval code: 0x01 = 1000 Hz, 0x02 = 500 Hz,
-#                          0x08 = 125 Hz (same convention as packet 2, byte 6)
-#   [7]    complement      additive complement to 0x55 (0x55 - rate byte)
-#   [8:16] observed fields, fixed across rates (01 54 00 55 00 00 00 00)
-#   [16]   checksum        tail byte such that the sum of all 17 bytes is
-#                          ≡ 0x55 (mod 256) — computed, not hardcoded.
+# CompX config-memory (EEPROM) write frame, 17 bytes — see
+# _build_write_frame() for the generic builder:
+#   [0:3]  0x08 0x07 0x00   report 0x08, write opcode 0x07, reserved
+#   [3:5]  AH AL            write address (big-endian; 0x0000 for the rate)
+#   [5]    LN               payload length (six bytes follow)
+#   [6:12] rate byte        interval code: 0x01 = 1000 Hz, 0x02 = 500 Hz,
+#                           0x08 = 125 Hz (same convention as packet 2, byte 6)
+#          complement       additive complement to 0x55 (0x55 - rate byte)
+#          01 54 00 55      observed fields, fixed across rates
+#   [12:16] 0x00 pad
+#   [16]   checksum         tail byte such that the sum of all 17 bytes is
+#                          ≡ 0x55 (mod 256) — computed, never hardcoded.
 
 # Config-memory read probe: the mouse exposes interface 1 without a hidraw
 # node, so reading is a SET_REPORT command whose reply the firmware pushes
-# onto the interface's interrupt-IN endpoint:
+# onto the interface's interrupt-IN endpoint (see _build_read_frame() and
+# _parse_read_reply()):
 #   command (17 bytes): 08 08 00 AH AL LN + ten 0x00 bytes + checksum
 #     report 0x08, opcode 0x08 (0x07 is the EEPROM-write opcode above);
 #     AH/AL = 16-bit register address (big-endian), LN = bytes to read;
@@ -127,26 +144,93 @@ PROBE_DPI_TABLE_END = 0x002C  # exclusive
 PROBE_DPI_SLOT_BYTES = 4
 
 
-def _compx_checksum(packet: bytes) -> int:
-    """CompX config-memory write packets: sum of all 17 bytes ≡ 0x55 (mod 256)."""
-    return (0x55 - sum(packet[:-1])) & 0xFF
+# ==========================================================================
+# Protocol primitives — pure byte-level CompX config framing. These
+# functions never touch the device: checksum, write/read frame builders,
+# the frame verifier and the read-reply parser. Every transport and the
+# self-check below consume them.
+# ==========================================================================
+
+
+def _compx_checksum(body: bytes) -> int:
+    """Checksum tail of a CompX config frame: appended to the 16 leading
+    bytes of a frame, the whole 17-byte frame sums to ≡ 0x55 (mod 256)."""
+    return (0x55 - sum(body)) & 0xFF
+
+
+def _verify_frame(frame: bytes) -> bool:
+    """True when `frame` sums to ≡ 0x55 (mod 256) — the identity every
+    CompX config frame (write, read command and read reply) must satisfy."""
+    return (sum(frame) & 0xFF) == 0x55
+
+
+def _build_write_frame(addr: int, data: bytes) -> bytes:
+    """Assemble the 17-byte config-memory write frame for (addr, data).
+
+    Layout: 08 07 00 AH AL LN + data + 0x00 pad + checksum tail, where
+    AH/AL is the big-endian 16-bit address and LN the payload length. The
+    `set` EEPROM packet is the canonical frame (see _eeprom_packet()).
+    """
+    if not 1 <= len(data) <= PROBE_MAX_READ_BYTES:
+        raise ValueError(
+            f"config write payload must be 1..{PROBE_MAX_READ_BYTES} bytes, "
+            f"got {len(data)}"
+        )
+    body = (
+        b"\x08\x07\x00"  # report 0x08, write opcode 0x07, reserved 0x00
+        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, len(data)))  # AH, AL, LN
+        + data
+        + b"\x00" * (PROBE_FRAME_BYTES - 7 - len(data))  # pad to 16 leading bytes
+    )
+    return body + bytes((_compx_checksum(body),))
+
+
+def _build_read_frame(addr: int, length: int) -> bytes:
+    """Assemble the 17-byte config-memory read command for (addr, length).
+
+    Layout: 08 08 00 AH AL LN + ten 0x00 pad bytes + checksum tail. The
+    firmware answers on the interrupt-IN endpoint with the reply frame
+    parsed by _parse_read_reply().
+    """
+    if not 1 <= length <= PROBE_MAX_READ_BYTES:
+        raise ValueError(
+            f"config read length must be 1..{PROBE_MAX_READ_BYTES}, got {length}"
+        )
+    body = (
+        b"\x08\x08\x00"  # report 0x08, read opcode 0x08, reserved 0x00
+        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, length))  # AH, AL, LN
+        + b"\x00" * 10  # pad to the 16 leading bytes
+    )
+    return body + bytes((_compx_checksum(body),))
+
+
+def _parse_read_reply(reply: bytes) -> bytes:
+    """Extract the payload of a config-memory read reply.
+
+    A reply is 09 08 00 AH AL LN + LN payload bytes + 0x00 pad + checksum;
+    LN is byte 5, so the frame itself says how long the payload is. Callers
+    verify the frame first (_verify_frame + header echo) and only then
+    trust the slice.
+    """
+    if len(reply) != PROBE_FRAME_BYTES:
+        raise ValueError(
+            f"config read reply must be {PROBE_FRAME_BYTES} bytes, "
+            f"got {len(reply)}"
+        )
+    return reply[6 : 6 + reply[5]]
 
 
 def _eeprom_packet(rate_code: int) -> bytes:
-    """Assemble the 17-byte EEPROM write packet for `rate_code`.
+    """Assemble the 17-byte EEPROM persistence packet for `rate_code`.
 
     `rate_code` is the report-interval code the write stores (see
-    INTERVAL_CODE_BY_RATE); the trailing checksum is derived from the sixteen
-    leading bytes so the tail can never drift out of sync with the payload.
+    INTERVAL_CODE_BY_RATE). The rate byte, its complement and the observed
+    fixed fields form the payload of a plain config-memory write at
+    0x0000, so the frame is delegated to _build_write_frame() and the tail
+    can never drift out of sync with the payload.
     """
-    prefix = (
-        b"\x08\x07"  # report 0x08, write opcode 0x07
-        b"\x00\x00"  # address 0x0000
-        b"\x00\x06"  # length 0x0006
-        + bytes((rate_code, 0x55 - rate_code))  # rate byte + complement
-        + b"\x01\x54\x00\x55\x00\x00\x00\x00"  # observed fields (fixed)
-    )
-    return prefix + bytes((_compx_checksum(prefix + b"\x00"),))
+    data = bytes((rate_code, 0x55 - rate_code)) + b"\x01\x54\x00\x55"
+    return _build_write_frame(0x0000, data)
 
 
 # Byte-identity reference for _verify_packet_generation(): the packets below
@@ -197,6 +281,155 @@ POLLING_VARIANTS: dict[int, tuple[bytes, ...]] = {
 }
 
 
+# ==========================================================================
+# USB transport (pyusb) — the raw-USB channel to interface 1. Works whether
+# or not the kernel bound the interface, so it is the primary channel of
+# `probe` and `set`. Each call owns its claimed session (_usb_config_device),
+# which lets callers compose _usb_send_report and _usb_read_reply freely.
+# ==========================================================================
+
+
+def _pyusb():
+    """Import pyusb lazily: it is only needed by the raw-USB `set`/`probe` paths."""
+    try:
+        import usb.core
+        import usb.util
+    except ImportError as exc:
+        raise RuntimeError(
+            "The `usb` package (pyusb) is missing — it is required for this "
+            "command. Install it with: pip install pyusb"
+        ) from exc
+    return usb.core, usb.util
+
+
+@contextlib.contextmanager
+def _usb_config_device():
+    """Yield the CompX mouse with its config interface (interface 1) claimed.
+
+    Detaches the kernel driver (usbhid) if it owns interface 1 and re-attaches
+    it on exit, so raw-USB traffic never leaves the interface in a broken
+    state. Shared by `set` (SET_REPORT writes) and `probe` (register reads),
+    which both talk to interface 1 through pyusb.
+    """
+    usb_core, usb_util = _pyusb()
+
+    usb_dev = None
+    for product_id in PRODUCT_IDS:
+        usb_dev = usb_core.find(idVendor=VENDOR_ID, idProduct=product_id)
+        if usb_dev is not None:
+            break
+    if usb_dev is None:
+        raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
+
+    detached = False
+    try:
+        if usb_dev.is_kernel_driver_active(1):
+            usb_dev.detach_kernel_driver(1)
+            detached = True
+        usb_util.claim_interface(usb_dev, 1)
+    except usb_core.USBError as exc:
+        raise RuntimeError(
+            f"Cannot claim the CompX config interface (interface 1): {exc}"
+        ) from exc
+
+    try:
+        yield usb_dev
+    finally:
+        try:
+            usb_util.release_interface(usb_dev, 1)
+        except usb_core.USBError:
+            pass  # the device vanished mid-operation — nothing left to restore
+        if detached:
+            try:
+                usb_dev.attach_kernel_driver(1)
+            except usb_core.USBError:
+                pass
+        usb_util.dispose_resources(usb_dev)
+
+
+def _usb_send_report(packet: bytes, report_type: int = 0x02) -> None:
+    """Deliver one report to interface 1 as a USB SET_REPORT (lazy import).
+
+    `report_type` is the wValue high byte: 0x02 (output report) for the
+    `set` rate packets, 0x03 (feature report) for the `probe` read command.
+    The firmware dispatches on the report payload, so both forms share this
+    one transport path.
+    """
+    with _usb_config_device() as usb_dev:
+        report_id = packet[0]
+        result = usb_dev.ctrl_transfer(
+            bmRequestType=0x21,
+            bRequest=9,  # SET_REPORT
+            wValue=(report_type << 8) | report_id,
+            wIndex=1,
+            data_or_wLength=packet,
+            timeout=1000,
+        )
+        if result != len(packet):
+            raise OSError("USB SET_REPORT rejected by the device")
+
+
+def _usb_read_reply(timeout: int = PROBE_READ_TIMEOUT_MS) -> bytes | None:
+    """Wait for one reply frame on the interrupt-IN endpoint of interface 1.
+
+    Finds the endpoint exactly like `probe` did historically (first
+    interrupt-IN descriptor of the interface) and reads one
+    PROBE_FRAME_BYTES frame. Returns None when the device sends no frame
+    within `timeout` ms; any other USB error propagates so the caller can
+    attach context to it.
+    """
+    usb_core, usb_util = _pyusb()
+    with _usb_config_device() as usb_dev:
+        try:
+            configuration = usb_dev.get_active_configuration()
+        except usb_core.USBError as exc:
+            raise RuntimeError(
+                f"Cannot read the active USB configuration: {exc}"
+            ) from exc
+        try:
+            interface = configuration[(1, 0)]
+        except KeyError as exc:
+            raise RuntimeError(
+                "The active USB configuration exposes no interface 1 "
+                "(CompX config interface)"
+            ) from exc
+
+        endpoint = usb_util.find_descriptor(
+            interface,
+            custom_match=lambda ep: (
+                usb_util.endpoint_direction(ep.bEndpointAddress)
+                == usb_util.ENDPOINT_IN
+                and usb_util.endpoint_type(ep.bmAttributes)
+                == usb_util.ENDPOINT_TYPE_INTR
+            ),
+        )
+        if endpoint is None:
+            raise RuntimeError(
+                "No interrupt-IN endpoint on the CompX config interface — "
+                "cannot read the config-memory reply"
+            )
+
+        try:
+            return bytes(
+                usb_dev.read(
+                    endpoint.bEndpointAddress,
+                    PROBE_FRAME_BYTES,
+                    timeout=timeout,
+                )
+            )
+        except usb_core.USBError as exc:
+            if exc.errno == errno.ETIMEDOUT:
+                return None  # no frame within `timeout` — the caller decides
+            raise
+
+
+# ==========================================================================
+# hidraw transport (hidapi + raw ioctl) — the second delivery channel of
+# `set`. Works only while the kernel bound interface 1 to usbhid and gave it
+# a hidraw node with one of the CONFIG_USAGE_PAGES.
+# ==========================================================================
+
+
 def _hidapi():
     """Import hidapi lazily: it is only needed by `set`, not `check`/`--help`."""
     try:
@@ -234,23 +467,6 @@ def find_device_entries() -> list[dict]:
     except Exception:
         return []
     return entries
-
-
-def find_device_paths() -> list[bytes]:
-    """Control hidraw paths: config usage pages first, interface #1 as fallback."""
-    entries = find_device_entries()
-    control_paths = _unique_paths(
-        entry["path"]
-        for entry in entries
-        if entry.get("usage_page") in CONFIG_USAGE_PAGES and entry.get("path")
-    )
-    if control_paths:
-        return control_paths
-    return _unique_paths(
-        entry["path"]
-        for entry in entries
-        if entry.get("interface_number") == 1 and entry.get("path")
-    )
 
 
 def _hidraw_ioctl(path: bytes, packet: bytes, *, output: bool = False) -> None:
@@ -321,184 +537,110 @@ def _send_packet_to_path(path: bytes, packet: bytes) -> None:
     raise OSError("device refused the report")
 
 
-def _pyusb():
-    """Import pyusb lazily: it is only needed by the raw-USB `set`/`probe` paths."""
-    try:
-        import usb.core
-        import usb.util
-    except ImportError as exc:
-        raise RuntimeError(
-            "The `usb` package (pyusb) is missing — it is required for this "
-            "command. Install it with: pip install pyusb"
-        ) from exc
-    return usb.core, usb.util
+# ==========================================================================
+# Device layer — device-level operations over the two transports:
+# control-path discovery, config register reads/writes and the multi-channel
+# `set` delivery engine (raw-USB always, hidraw paths when present).
+# ==========================================================================
 
 
-@contextlib.contextmanager
-def _usb_config_device():
-    """Yield the CompX mouse with its config interface (interface 1) claimed.
-
-    Detaches the kernel driver (usbhid) if it owns interface 1 and re-attaches
-    it on exit, so raw-USB traffic never leaves the interface in a broken
-    state. Shared by `set` (SET_REPORT writes) and `probe` (register reads),
-    which both talk to interface 1 through pyusb.
-    """
-    usb_core, usb_util = _pyusb()
-
-    usb_dev = None
-    for product_id in PRODUCT_IDS:
-        usb_dev = usb_core.find(idVendor=VENDOR_ID, idProduct=product_id)
-        if usb_dev is not None:
-            break
-    if usb_dev is None:
-        raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
-
-    detached = False
-    try:
-        if usb_dev.is_kernel_driver_active(1):
-            usb_dev.detach_kernel_driver(1)
-            detached = True
-        usb_util.claim_interface(usb_dev, 1)
-    except usb_core.USBError as exc:
-        raise RuntimeError(
-            f"Cannot claim the CompX config interface (interface 1): {exc}"
-        ) from exc
-
-    try:
-        yield usb_dev
-    finally:
-        try:
-            usb_util.release_interface(usb_dev, 1)
-        except usb_core.USBError:
-            pass  # the device vanished mid-operation — nothing left to restore
-        if detached:
-            try:
-                usb_dev.attach_kernel_driver(1)
-            except usb_core.USBError:
-                pass
-        usb_util.dispose_resources(usb_dev)
-
-
-def _usb_set_feature_report(packet: bytes) -> None:
-    """Send `packet` as a USB feature SET_REPORT via pyusb (lazy import)."""
-    with _usb_config_device() as usb_dev:
-        report_id = packet[0]
-        result = usb_dev.ctrl_transfer(
-            bmRequestType=0x21,
-            bRequest=9,  # SET_REPORT
-            wValue=0x0200 | report_id,  # feature report type
-            wIndex=1,
-            data_or_wLength=packet,
-            timeout=1000,
-        )
-        if result != len(packet):
-            raise OSError("USB SET_REPORT rejected by the device")
-
-
-def _probe_read_command(addr: int, length: int) -> bytes:
-    """Assemble the 17-byte config-memory read command for (addr, length)."""
-    prefix = (
-        b"\x08\x08"  # report 0x08, read opcode 0x08
-        b"\x00"  # reserved byte (observed zero)
-        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, length))  # AH, AL, LN
-        + b"\x00" * 10  # pad to the write-packet shape; checksum tail follows
+def find_device_paths() -> list[bytes]:
+    """Control hidraw paths: config usage pages first, interface #1 as fallback."""
+    entries = find_device_entries()
+    control_paths = _unique_paths(
+        entry["path"]
+        for entry in entries
+        if entry.get("usage_page") in CONFIG_USAGE_PAGES and entry.get("path")
     )
-    return prefix + bytes((_compx_checksum(prefix + b"\x00"),))
+    if control_paths:
+        return control_paths
+    return _unique_paths(
+        entry["path"]
+        for entry in entries
+        if entry.get("interface_number") == 1 and entry.get("path")
+    )
 
 
-def _probe_read_registers(addr: int, length: int) -> bytes:
-    """Read up to 10 config-memory bytes at `addr`; return exactly `length` bytes.
+def get_active_product_id() -> int | None:
+    """Return the first CompX product id visible on the bus, or None."""
+    hid = _hidapi()
+    for product_id in PRODUCT_IDS:
+        if hid.enumerate(VENDOR_ID, product_id):
+            return product_id
+    return None
 
-    Sends the read command as a SET_REPORT and picks the answer off the
-    interrupt-IN endpoint of interface 1. The reply echoes AH/AL/LN and must
-    sum to 0x55, so both are verified before the payload is trusted.
+
+def read_config_register(addr: int, length: int) -> bytes:
+    """Read `length` config-memory bytes at `addr` via the raw-USB channel.
+
+    Sends the read frame as a feature SET_REPORT and picks the reply off the
+    interrupt-IN endpoint. The reply echoes AH/AL/LN and must sum to 0x55,
+    so both are verified before the payload is trusted. Errors surface as
+    RuntimeError with the failing address attached.
     """
-    if length < 1 or length > PROBE_MAX_READ_BYTES:
-        raise ValueError(
-            f"register read length must be 1..{PROBE_MAX_READ_BYTES}, got {length}"
+    command = _build_read_frame(addr, length)
+    try:
+        _usb_send_report(command, report_type=0x03)  # feature report 0x0308
+    except OSError as exc:
+        raise RuntimeError(
+            f"USB SET_REPORT failed while reading config memory at "
+            f"0x{addr:04X}: {exc}"
+        ) from exc
+
+    try:
+        reply = _usb_read_reply()
+    except OSError as exc:
+        raise RuntimeError(
+            f"No config-memory reply from the device for 0x{addr:04X} "
+            f"(interrupt-IN read: {exc})"
+        ) from exc
+    if reply is None:
+        raise RuntimeError(
+            f"No config-memory reply from the device for 0x{addr:04X} "
+            f"(interrupt-IN read timed out)"
         )
 
-    command = _probe_read_command(addr, length)
-    with _usb_config_device() as usb_dev:
-        usb_core, usb_util = _pyusb()
-        try:
-            configuration = usb_dev.get_active_configuration()
-        except usb_core.USBError as exc:
-            raise RuntimeError(
-                f"Cannot read the active USB configuration: {exc}"
-            ) from exc
-        try:
-            interface = configuration[(1, 0)]
-        except KeyError as exc:
-            raise RuntimeError(
-                "The active USB configuration exposes no interface 1 "
-                "(CompX config interface)"
-            ) from exc
-
-        endpoint = usb_util.find_descriptor(
-            interface,
-            custom_match=lambda ep: (
-                usb_util.endpoint_direction(ep.bEndpointAddress)
-                == usb_util.ENDPOINT_IN
-                and usb_util.endpoint_type(ep.bmAttributes)
-                == usb_util.ENDPOINT_TYPE_INTR
-            ),
+    if len(reply) != PROBE_FRAME_BYTES:
+        raise RuntimeError(
+            f"Short config-memory reply for 0x{addr:04X}: got "
+            f"{len(reply)} bytes, expected {PROBE_FRAME_BYTES}"
         )
-        if endpoint is None:
-            raise RuntimeError(
-                "No interrupt-IN endpoint on the CompX config interface — "
-                "cannot read the config-memory reply"
-            )
+    if reply[3:6] != command[3:6]:
+        raise RuntimeError(
+            f"Config-memory reply header mismatch for 0x{addr:04X}: "
+            f"echo AH/AL/LN = {reply[3:6].hex(' ')} "
+            f"(expected {command[3:6].hex(' ')}) — stale reply?"
+        )
+    if not _verify_frame(reply):
+        raise RuntimeError(
+            f"Config-memory reply checksum mismatch for 0x{addr:04X}: "
+            "frame does not sum to 0x55"
+        )
+    return _parse_read_reply(reply)
 
-        try:
-            result = usb_dev.ctrl_transfer(
-                bmRequestType=0x21,
-                bRequest=9,  # SET_REPORT
-                wValue=0x0300 | command[0],  # 0x0308: feature report 0x08
-                wIndex=1,
-                data_or_wLength=command,
-                timeout=1000,
-            )
-            if result != len(command):
-                raise RuntimeError("USB SET_REPORT returned a short write")
-        except usb_core.USBError as exc:
-            raise RuntimeError(
-                f"USB SET_REPORT failed while reading config memory at "
-                f"0x{addr:04X}: {exc}"
-            ) from exc
 
-        try:
-            reply = bytes(
-                usb_dev.read(
-                    endpoint.bEndpointAddress,
-                    PROBE_FRAME_BYTES,
-                    timeout=PROBE_READ_TIMEOUT_MS,
-                )
-            )
-        except usb_core.USBError as exc:
-            raise RuntimeError(
-                f"No config-memory reply from the device for 0x{addr:04X} "
-                f"(interrupt-IN read: {exc})"
-            ) from exc
+def write_config(addr: int, data: bytes) -> None:
+    """Write `data` to config memory at `addr` via the raw-USB channel.
 
-        if len(reply) != PROBE_FRAME_BYTES:
-            raise RuntimeError(
-                f"Short config-memory reply for 0x{addr:04X}: got "
-                f"{len(reply)} bytes, expected {PROBE_FRAME_BYTES}"
-            )
-        requested = bytes(((addr >> 8) & 0xFF, addr & 0xFF, length))
-        if reply[3:6] != requested:
-            raise RuntimeError(
-                f"Config-memory reply header mismatch for 0x{addr:04X}: "
-                f"echo AH/AL/LN = {reply[3:6].hex(' ')} "
-                f"(expected {requested.hex(' ')}) — stale reply?"
-            )
-        if (sum(reply) & 0xFF) != 0x55:
-            raise RuntimeError(
-                f"Config-memory reply checksum mismatch for 0x{addr:04X}: "
-                "frame does not sum to 0x55"
-            )
-        return reply[6 : 6 + length]
+    The generic counterpart of read_config_register(): builds the write
+    frame and delivers it as an output SET_REPORT. `set` uses the same frame
+    shape for its EEPROM packet, but delivers it through the full per-packet
+    pipeline in _apply_rate_packets().
+    """
+    frame = _build_write_frame(addr, data)
+    try:
+        _usb_send_report(frame)
+    except OSError as exc:
+        raise RuntimeError(
+            f"USB SET_REPORT failed while writing config memory at "
+            f"0x{addr:04X}: {exc}"
+        ) from exc
+
+
+def _format_hid_error(exc: BaseException) -> str:
+    if isinstance(exc, PermissionError):
+        return HID_PERMISSION_TEXT
+    return str(exc)
 
 
 def _apply_rate_packets(
@@ -519,7 +661,7 @@ def _apply_rate_packets(
 
     for index, packet in enumerate(packets):
         try:
-            _usb_set_feature_report(packet)
+            _usb_send_report(packet)
         except Exception as exc:
             errors.append(f"usb: {exc}")
         else:
@@ -545,21 +687,6 @@ def _apply_rate_packets(
     return delivered, eeprom_written, errors
 
 
-def get_active_product_id() -> int | None:
-    """Return the first CompX product id visible on the bus, or None."""
-    hid = _hidapi()
-    for product_id in PRODUCT_IDS:
-        if hid.enumerate(VENDOR_ID, product_id):
-            return product_id
-    return None
-
-
-def _format_hid_error(exc: BaseException) -> str:
-    if isinstance(exc, PermissionError):
-        return HID_PERMISSION_TEXT
-    return str(exc)
-
-
 def send_polling_packet(rate: int) -> tuple[set[int], bool, list[str]]:
     """Apply `rate` on every control path found (raw-USB fallback included).
 
@@ -583,6 +710,12 @@ def send_polling_packet(rate: int) -> tuple[set[int], bool, list[str]]:
         eeprom_written = eeprom_written or written
         errors.extend(path_errors)
     return delivered, eeprom_written, errors
+
+
+# ==========================================================================
+# Input measurement (evdev) — `check` support: locate the mouse input node
+# and count EV_REL events on it. Unrelated to the config interface above.
+# ==========================================================================
 
 
 def _sysfs_usb_id(event_path: str) -> tuple[str, str]:
@@ -672,6 +805,11 @@ def measure_event_rate_hz(event_path: str, seconds: float = MEASURE_SECONDS) -> 
     return counted / seconds
 
 
+# ==========================================================================
+# Commands — CLI entry points; behaviour and output are frozen by v1.0.1.
+# ==========================================================================
+
+
 def cmd_set(args: argparse.Namespace) -> int:
     """`set` entry point: apply a polling rate and report the outcome."""
     rate = args.rate
@@ -746,7 +884,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     data = bytearray()
     for offset in range(0, length, PROBE_BLOCK_BYTES):
         chunk_length = min(PROBE_BLOCK_BYTES, length - offset)
-        data.extend(_probe_read_registers(start + offset, chunk_length))
+        data.extend(read_config_register(start + offset, chunk_length))
 
     end = start + length
     for offset in range(0, length, PROBE_BLOCK_BYTES):
