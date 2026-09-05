@@ -79,7 +79,7 @@ The mouse never confirms a report, and the config interface is finicky about ker
 
 Sends are retried briefly — after the pyusb step detaches and re-attaches the kernel driver, udev re-creates the hidraw node and it may not be openable for a moment.
 
-A rate change counts as successful once **at least 2 of the 3 packets** were delivered (`Packets sent: N (minimum for success: 2)`). If several supported devices are connected, every control path found gets the new rate.
+Success is counted per **distinct** packet, not per delivery: a packet delivered by more than one channel (USB `SET_REPORT`, hidapi, raw hidraw ioctl) still counts once. A rate change counts as successful once **at least 2 of the 3 distinct packets** were delivered (`Packets delivered: N/3 distinct (minimum for success: 2)`). If several supported devices are connected, every control path found gets the new rate.
 
 Honest caveat: the device sends no acknowledgement. "Success" means the packets were delivered, not that the chip confirmed them — that is exactly what `check` is for.
 
@@ -100,8 +100,8 @@ The rate is the event count divided by the window — a practical, honest verifi
 Requirements:
 
 - Linux with Python 3;
-- `hidapi` — device discovery and the primary report transport (required for `set`);
-- `pyusb` — the direct USB `SET_REPORT` fallback channel (recommended; without it the tool still works via hidapi and prints a warning);
+- `hidapi` — device discovery and the primary report transport. Needed only for `set`: `check`, `--help`, and `--version` work without it (imported lazily);
+- `pyusb` — optional direct USB `SET_REPORT` fallback channel (recommended; without it `set` still works via hidapi and prints a warning);
 - `evdev` — event counting for `check` only.
 
 ```bash
@@ -134,7 +134,7 @@ Verify the install:
 
 ```console
 $ python3 compxctl.py --version
-compxctl 1.0.0
+compxctl 1.0.1
 ```
 
 ## Usage
@@ -145,7 +145,7 @@ compxctl 1.0.0
 $ python3 compxctl.py set 1000
 Rate: 1000 Hz
 PID: 0xfa7b
-Packets sent: 6 (minimum for success: 2)
+Packets delivered: 3/3 distinct (minimum for success: 2)
 EEPROM write: done
 ```
 
@@ -153,7 +153,7 @@ What the output means:
 
 - `Rate` — what you asked for;
 - `PID` — the product id of the device that was found on the bus;
-- `Packets sent` — successful deliveries across all transports; the exact number varies with how many channels succeeded, success is `>= 2`;
+- `Packets delivered` — how many **distinct** packets out of the three reached the device (`N/3 distinct`; a packet that went through more than one channel counts once). Success is `>= 2` distinct packets;
 - `EEPROM write` — `done` when the persistence report went through; `not confirmed (rate may reset after re-plug)` when it did not.
 
 Non-fatal problems are printed to stderr as `warning: …` lines without failing the command — for example `warning: usb: pyusb is not installed (pip install pyusb)` when the fallback channel is missing. If the device rejects the packets, the command fails with `Error: the device rejected the polling-rate packets`, followed by one indented line per failed transport.
