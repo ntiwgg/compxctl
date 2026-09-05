@@ -16,9 +16,7 @@ import threading
 import time
 from pathlib import Path
 
-import hid
-
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 VENDOR_ID = 0x25A7
 PRODUCT_IDS = (0xFA7B, 0xFA7C, 0xFA03, 0xFA93)
@@ -35,6 +33,12 @@ MEASURE_SECONDS = 1.5
 # kernel driver, and udev needs a moment to re-create the hidraw node.
 SEND_ATTEMPTS = 6
 SEND_RETRY_DELAY_SEC = 0.1
+
+# Linux hidraw ioctl numbers (uapi/linux/hidraw.h). The request word mirrors
+# _IOC(_IOC_READ | _IOC_WRITE, 'H', nr, size) = 0xC0000000 | (size << 16)
+# | (ord('H') << 8) | nr; size is the report length (< 2**16).
+HIDIOCSFEATURE = 0x06
+HIDIOCSOUTPUT = 0x0B
 
 # Fixed by-id names of the mouse input nodes (checked first by `check`).
 MOUSE_BY_ID_PATHS = (
@@ -87,6 +91,18 @@ POLLING_VARIANTS: dict[int, tuple[bytes, ...]] = {
 }
 
 
+def _hidapi():
+    """Import hidapi lazily: it is only needed by `set`, not `check`/`--help`."""
+    try:
+        import hid
+    except ImportError as exc:
+        raise RuntimeError(
+            "The `hid` package (hidapi) is missing — it is required for `set`. "
+            "Install it with: pip install hidapi"
+        ) from exc
+    return hid
+
+
 def _unique_paths(paths: list[bytes]) -> list[bytes]:
     """Drop duplicates while preserving first-seen order."""
     seen: set[bytes] = set()
@@ -99,7 +115,12 @@ def _unique_paths(paths: list[bytes]) -> list[bytes]:
 
 
 def find_device_entries() -> list[dict]:
-    """Enumerate every CompX product known to hidapi (never raises)."""
+    """Enumerate every CompX product known to hidapi; [] if enumeration fails.
+
+    Raises RuntimeError when the `hid` package is not installed — the error is
+    deliberate and must not be swallowed by the enumeration fallback below.
+    """
+    hid = _hidapi()
     entries: list[dict] = []
     try:
         for product_id in PRODUCT_IDS:
@@ -129,14 +150,16 @@ def find_device_paths() -> list[bytes]:
 def _hidraw_ioctl(path: bytes, packet: bytes, *, output: bool = False) -> None:
     """Send `packet` through the raw hidraw ioctl, bypassing hidapi."""
     size = len(packet)
-    nr = 0x0B if output else 0x06  # HIDIOCSOUTPUT / HIDIOCSFEATURE
+    nr = HIDIOCSOUTPUT if output else HIDIOCSFEATURE
+    # The request word mirrors _IOC(_IOC_READ | _IOC_WRITE, 'H', nr, size) from
+    # uapi/linux/hidraw.h.
     request = 0xC0000000 | (size << 16) | (ord("H") << 8) | nr
     with open(path, "wb+", buffering=0) as handle:
         if fcntl.ioctl(handle, request, packet) < 0:
             raise OSError("hidraw ioctl rejected the report")
 
 
-def _send_packet_to_device(dev: hid.device, packet: bytes) -> None:
+def _send_packet_to_device(dev, packet: bytes) -> None:
     """Try a feature report first, then a plain output write on one hidapi handle."""
     last_error = "hidapi refused the report"
     for sender_name, sender in (
@@ -162,6 +185,7 @@ def _send_packet_to_path(path: bytes, packet: bytes) -> None:
     re-attaches the kernel driver, udev re-creates the hidraw node and it may
     not be openable for a moment. Retries never duplicate a successful send.
     """
+    hid = _hidapi()
     errors: list[OSError] = []
     for attempt in range(SEND_ATTEMPTS):
         try:
@@ -236,12 +260,14 @@ def _usb_set_feature_report(packet: bytes) -> None:
         usb.util.dispose_resources(usb_dev)
 
 
-def _apply_rate_packets(path: bytes, rate: int) -> tuple[int, bool, list[str]]:
+def _apply_rate_packets(path: bytes, rate: int) -> tuple[set[int], bool, list[str]]:
     """Send every packet of `rate` to one path: USB first, then hidapi + ioctl.
 
-    Returns (packets_sent, eeprom_packet_written, errors).
+    Returns (delivered, eeprom_packet_written, errors); `delivered` holds the
+    indices of every distinct packet accepted by at least one channel, so a
+    packet confirmed twice (USB and hidapi) still counts once.
     """
-    sent = 0
+    delivered: set[int] = set()
     eeprom_written = False
     errors: list[str] = []
     packets = POLLING_VARIANTS[rate]
@@ -252,7 +278,7 @@ def _apply_rate_packets(path: bytes, rate: int) -> tuple[int, bool, list[str]]:
         except Exception as exc:
             errors.append(f"usb: {exc}")
         else:
-            sent += 1
+            delivered.add(index)
             if index == EEPROM_PACKET_INDEX:
                 eeprom_written = True
 
@@ -264,15 +290,16 @@ def _apply_rate_packets(path: bytes, rate: int) -> tuple[int, bool, list[str]]:
         except Exception as exc:
             errors.append(str(exc))
         else:
-            sent += 1
+            delivered.add(index)
             if index == EEPROM_PACKET_INDEX:
                 eeprom_written = True
 
-    return sent, eeprom_written, errors
+    return delivered, eeprom_written, errors
 
 
 def get_active_product_id() -> int | None:
     """Return the first CompX product id visible on the bus, or None."""
+    hid = _hidapi()
     for product_id in PRODUCT_IDS:
         if hid.enumerate(VENDOR_ID, product_id):
             return product_id
@@ -285,25 +312,27 @@ def _format_hid_error(exc: BaseException) -> str:
     return str(exc)
 
 
-def send_polling_packet(rate: int) -> tuple[int, bool, list[str]]:
+def send_polling_packet(rate: int) -> tuple[set[int], bool, list[str]]:
     """Apply `rate` on every control path found.
 
-    Returns (packets_sent, eeprom_packet_written, errors). Success means at
-    least MIN_SENT_FOR_SUCCESS packet sends went through (see POLLING_VARIANTS).
+    Returns (delivered, eeprom_packet_written, errors); `delivered` is the
+    union of distinct packet indices confirmed on any path. Success means at
+    least MIN_SENT_FOR_SUCCESS distinct packets were delivered (see
+    POLLING_VARIANTS).
     """
     paths = find_device_paths()
     if not paths:
         raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
 
-    total_sent = 0
+    delivered: set[int] = set()
     eeprom_written = False
     errors: list[str] = []
     for path in paths:
-        sent, written, path_errors = _apply_rate_packets(path, rate)
-        total_sent += sent
+        path_delivered, written, path_errors = _apply_rate_packets(path, rate)
+        delivered |= path_delivered
         eeprom_written = eeprom_written or written
         errors.extend(path_errors)
-    return total_sent, eeprom_written, errors
+    return delivered, eeprom_written, errors
 
 
 def _sysfs_usb_id(event_path: str) -> tuple[str, str]:
@@ -401,13 +430,17 @@ def cmd_set(args: argparse.Namespace) -> int:
         print(f"Error: {DEVICE_NOT_FOUND_TEXT}", file=sys.stderr)
         return 1
 
-    sent, eeprom_written, errors = send_polling_packet(rate)
-    if sent >= MIN_SENT_FOR_SUCCESS:
+    delivered, eeprom_written, errors = send_polling_packet(rate)
+    if len(delivered) >= MIN_SENT_FOR_SUCCESS:
         pid = get_active_product_id()
         pid_text = hex(pid) if pid is not None else "unknown"
+        total = len(POLLING_VARIANTS[rate])
         print(f"Rate: {rate} Hz")
         print(f"PID: {pid_text}")
-        print(f"Packets sent: {sent} (minimum for success: {MIN_SENT_FOR_SUCCESS})")
+        print(
+            f"Packets delivered: {len(delivered)}/{total} distinct "
+            f"(minimum for success: {MIN_SENT_FOR_SUCCESS})"
+        )
         if eeprom_written:
             print("EEPROM write: done")
         else:
@@ -460,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
         "set",
         help="apply a polling rate (125, 500 or 1000 Hz)",
         description="Apply a polling rate to the CompX mouse and print the result "
-                    "(rate, PID, packets sent, EEPROM write status).",
+                    "(rate, PID, distinct packets delivered, EEPROM write status).",
     )
     set_parser.add_argument(
         "rate",
