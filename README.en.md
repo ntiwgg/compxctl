@@ -305,7 +305,7 @@ Interpretation:
 
 ## License
 
-There is no LICENSE file yet. This is an unofficial reverse-engineering project. Not affiliated with, endorsed by, or supported by CompX, Ardor Gaming, Areson Technology, or their distributors. The protocol was obtained experimentally and is used at your own risk; the tool comes with no warranty.
+The project is distributed under the MIT License — see the [LICENSE](LICENSE) file for the full text. This is an unofficial reverse-engineering project. Not affiliated with, endorsed by, or supported by CompX, Ardor Gaming, Areson Technology, or their distributors. The protocol was obtained experimentally and is used at your own risk; the tool comes with no warranty.
 
 
 
