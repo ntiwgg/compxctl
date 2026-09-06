@@ -15,7 +15,7 @@ I play CS and moved to Linux. My CompX / Ardor Gaming mouse worked, but its defa
 
 So I reverse-engineered the mouse's proprietary HID protocol and built `compxctl` — a small CLI that switches the polling rate and the DPI levels right on the device, including an EEPROM write so the setting survives unplugging.
 
-It was a two-person job: I set the direction, worked out the protocol and verified every step on the real mouse. The code was written and refactored together with an AI assistant.
+It was a two-person job: I set the direction, worked out the protocol and verified every step on the real mouse. The code was written and refactored together with an AI assistant (the deepseek-v4-flash model).
 
 Along the way we found a good bug: an early version of the rate write clobbered the mouse's DPI fields (registers `0x0002..0x0005`) and broke the DPI-cycle button. Fixed — the EEPROM write now stores only two bytes at `0x0000` and leaves neighbouring registers alone. The fix is recorded in git as the commit "Preserve DPI level fields…".
 
