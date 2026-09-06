@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """compxctl.py — control a CompX / Ardor Gaming mouse: set the polling
-rate, snapshot the device state (`status`), read the battery (`battery`),
-measure the real rate (`check`) and probe (read back) its config memory.
+rate, list or set its DPI levels (`dpi`), snapshot the device state
+(`status`), read the battery (`battery`), measure the real rate (`check`)
+and probe (read back) its config memory.
 
 The proprietary control protocol lives below — the packet table and report
 order for `set` in POLLING_VARIANTS, the config-memory read framing for
@@ -167,6 +168,16 @@ ACTIVE_DPI_LEVEL_ADDR = 0x0004  # 1 byte level index, complement at +1
 # 0-based, so the active slot is (level − offset); exact firmware meaning
 # still pending calibration.
 ACTIVE_LEVEL_OFFSET = 1
+# DPI write policy: slots 0..5 store the plain encoding (x = y = code,
+# mul = 0), so they are writable; slots 6..7 of this mouse hold the
+# not-yet-understood extended encoding (see read_dpi_slots) and are listed
+# but never overwritten.
+DPI_WRITE_SLOT_MAX = 5
+DPI_LEVEL_INDEX_MIN = 1
+DPI_LEVEL_INDEX_MAX = 8
+DPI_VALUE_ERROR_TEXT = "DPI must be a multiple of 50 between 50 and 6400"
+DPI_SLOT_ERROR_TEXT = "slot must be 0..5"
+DPI_EXTENDED_SLOT_ERROR_TEXT = "cannot write extended slot"
 # Battery reply echo: the 08 04 request comes back as 09 04 ... with
 # reply[5] = link state, reply[6] = percent, reply[7] = charging flag.
 # Observed on hardware: 09 04 00 00 00 02 64 00 -> 100%, not charging.
@@ -1196,6 +1207,142 @@ def cmd_battery(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_dpi_slots() -> int:
+    """Print the DPI slot table and the active-level line (`dpi list`)."""
+    slots = read_dpi_slots()
+    active_pair = read_active_dpi_level()
+
+    active_slot: int | None = None
+    if active_pair is not None:
+        index = active_pair[0]
+        if DPI_LEVEL_INDEX_MIN <= index <= DPI_LEVEL_INDEX_MAX:
+            active_slot = index - ACTIVE_LEVEL_OFFSET
+
+    print(
+        "DPI slots (register 0x0004 = active level index; "
+        "'*' marks the active slot):"
+    )
+    print(
+        "  "
+        + "slot".ljust(6)
+        + "addr".ljust(8)
+        + "x".ljust(5)
+        + "y".ljust(5)
+        + "mul".ljust(5)
+        + "crc".ljust(6)
+        + "value"
+    )
+    for slot in slots:
+        star = "*" if slot["index"] == active_slot else " "
+        print(
+            "  "
+            + f"{star}{slot['index']}".ljust(6)
+            + f"0x{slot['addr']:04X}".ljust(8)
+            + f"{slot['x']:02X}".ljust(5)
+            + f"{slot['y']:02X}".ljust(5)
+            + f"{slot['mul']:02X}".ljust(5)
+            + f"{slot['crc']:02X}".ljust(6)
+            + _slot_value_text(slot)
+        )
+
+    if active_pair is None:
+        print("Active DPI level: unknown (register 0x0004 unset, 0xFF 0xFF)")
+    elif active_slot is None:
+        index = active_pair[0]
+        print(
+            f"Active DPI level: unknown (register 0x0004 holds 0x{index:02X}, "
+            f"not a 1..{DPI_LEVEL_INDEX_MAX} index)"
+        )
+    else:
+        print(
+            f"Active DPI level: slot {active_slot} "
+            f"(index 0x{active_pair[0]:02X}) → "
+            f"{_slot_value_text(slots[active_slot])}"
+        )
+    return 0
+
+
+def _resolve_active_slot() -> tuple[int, bool]:
+    """Map register 0x0004 to the writable slot: (slot, active_known).
+
+    The level index is 1-based (ACTIVE_LEVEL_OFFSET), so 1..8 maps to slots
+    0..7. Any other byte — 0x00 (old `set` runs cleared the marker) or 0xFF
+    (unset) — means the active level is unknown: the caller falls back to
+    slot 0 and warns before writing.
+    """
+    pair = read_active_dpi_level()
+    if pair is None:
+        return 0, False
+    index = pair[0]
+    if DPI_LEVEL_INDEX_MIN <= index <= DPI_LEVEL_INDEX_MAX:
+        return index - ACTIVE_LEVEL_OFFSET, True
+    return 0, False
+
+
+def _write_dpi_slot(target_slot: int, code: int) -> None:
+    """Write `code` into both axes of `target_slot`, then read it back.
+
+    The plain slot payload is (code, code, 0x00, checksum) with the per-slot
+    checksum identity 0x55 − x − y − mul, i.e. 0x55 − 2·code. Readback
+    verification fails fast when the stored code does not echo.
+    """
+    addr = PROBE_DPI_TABLE_START + PROBE_DPI_SLOT_BYTES * target_slot
+    checksum = (0x55 - 2 * code) & 0xFF
+    write_config(addr, bytes((code, code, 0x00, checksum)))
+    readback = read_config_register(addr, PROBE_DPI_SLOT_BYTES)
+    if readback[0] != code:
+        raise RuntimeError(
+            f"Readback verification failed for slot {target_slot} at "
+            f"0x{addr:04X}: stored x=0x{readback[0]:02X}, expected 0x{code:02X}"
+        )
+
+
+def cmd_dpi(args: argparse.Namespace) -> int:
+    """`dpi` entry point: list the slot table or write a DPI value.
+
+    Bare `dpi` and `dpi list` print the eight slot rows with the active one
+    marked; `dpi N` writes the plain encoding into the active level's slot
+    and `dpi --slot S N` into an explicit slot 0..5.
+    """
+    value = args.value
+    slot_arg = args.slot
+
+    if slot_arg is not None and value in (None, "list"):
+        raise RuntimeError("--slot requires a DPI value (`dpi --slot S N`)")
+    if value is None or value == "list":
+        return _print_dpi_slots()
+
+    code = dpi_code(value)
+    if code is None:
+        raise RuntimeError(DPI_VALUE_ERROR_TEXT)
+
+    active_known = False
+    if slot_arg is not None:
+        if not 0 <= slot_arg <= DPI_WRITE_SLOT_MAX:
+            raise RuntimeError(DPI_SLOT_ERROR_TEXT)
+        target_slot = slot_arg
+    else:
+        target_slot, active_known = _resolve_active_slot()
+        if active_known and target_slot > DPI_WRITE_SLOT_MAX:
+            raise RuntimeError(DPI_EXTENDED_SLOT_ERROR_TEXT)
+
+    if slot_arg is None and not active_known:
+        print(
+            "warning: active DPI level unknown (register 0x0004 not a "
+            f"1..{DPI_LEVEL_INDEX_MAX} index) — writing slot {target_slot}",
+            file=sys.stderr,
+        )
+
+    slots = read_dpi_slots()
+    old_text = _slot_value_text(slots[target_slot])
+
+    _write_dpi_slot(target_slot, code)
+    subject = "active level" if active_known else f"slot {target_slot}"
+    print(f"DPI set: {subject} → {value} (was {old_text})")
+    print(f"slot {target_slot} updated, verified")
+    return 0
+
+
 def cmd_set(args: argparse.Namespace) -> int:
     """`set` entry point: apply a polling rate and report the outcome."""
     rate = args.rate
@@ -1255,6 +1402,19 @@ def _parse_hex_arg(text: str) -> int:
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"invalid hex value {text!r} (use e.g. 0x000C)"
+        ) from None
+
+
+def _parse_dpi_value(text: str) -> int | str:
+    """Parse the `dpi` positional value: the literal 'list' or an integer."""
+    if text == "list":
+        return "list"
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid DPI value {text!r} (use 'list' or a multiple of 50 "
+            "between 50 and 6400)"
         ) from None
 
 
@@ -1358,6 +1518,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="target polling rate in Hz",
     )
     set_parser.set_defaults(func=cmd_set)
+
+    dpi_parser = subparsers.add_parser(
+        "dpi",
+        help="list DPI slots or set the active/selected level's DPI",
+        description="List the eight DPI slot rows and the active level, or "
+                    "write a DPI value into the active slot (default) or a "
+                    "chosen slot (--slot). Bare `dpi` equals `dpi list`. "
+                    "Requires pyusb.",
+    )
+    dpi_parser.add_argument(
+        "value",
+        metavar="VALUE",
+        type=_parse_dpi_value,
+        nargs="?",
+        default=None,
+        help="'list' or a target DPI multiple of 50 in 50..6400 "
+             "(bare `dpi` lists)",
+    )
+    dpi_parser.add_argument(
+        "--slot",
+        metavar="S",
+        type=int,
+        default=None,
+        help="write slot S (0..5) instead of the active slot",
+    )
+    dpi_parser.set_defaults(func=cmd_dpi)
 
     check_parser = subparsers.add_parser(
         "check",
