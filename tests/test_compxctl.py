@@ -208,6 +208,20 @@ def test_parse_read_reply_payload_length_tracked() -> None:
     assert parsed == reply[6:10]
 
 
+@pytest.mark.parametrize("bad_ln", [0x00, 0x0B, 0x40])
+def test_parse_read_reply_rejects_invalid_length_byte(bad_ln: int) -> None:
+    """A full frame whose LN byte lies outside 1..10 is refused loudly.
+
+    LN says how many payload bytes follow, and the firmware ceiling is 10
+    (PROBE_MAX_READ_BYTES); 0x00 or anything past 0x0A can never be a real
+    reply, so the parser must not trust the slice.
+    """
+    reply = bytearray(_read_reply(0x0000, b"\x01\x54"))
+    reply[5] = bad_ln
+    with pytest.raises(ValueError):
+        compxctl._parse_read_reply(bytes(reply))
+
+
 # ==========================================================================
 # DPI codec
 # ==========================================================================
@@ -401,3 +415,91 @@ def test_main_selfcheck_passes_on_known_good(
     monkeypatch.setattr(compxctl, "cmd_status", lambda args: _record_call(called, args))
     assert compxctl.main([]) == 0
     assert len(called) == 1
+
+
+# ==========================================================================
+# main() error handling and cmd_dpi validation (no device is touched)
+# ==========================================================================
+
+
+def _fail_if_device_touched(*args, **kwargs):
+    raise AssertionError("command must fail before touching the device")
+
+
+def test_main_dpi_rejects_slot_outside_writable_range(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`dpi --slot 9` exits 1 with an error, before any device I/O.
+
+    Writable slots are 0..DPI_WRITE_SLOT_MAX, so slot 9 fails at the
+    boundary even though the DPI value itself is encodable.
+    """
+    monkeypatch.setattr(compxctl, "read_dpi_slots", _fail_if_device_touched)
+    assert compxctl.main(["dpi", "--slot", "9", "800"]) == 1
+    assert compxctl.DPI_SLOT_ERROR_TEXT in capsys.readouterr().err
+
+
+def test_main_dpi_rejects_value_outside_codec_range(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`dpi 6500` exits 1 with an error, before any device I/O.
+
+    6500 is a multiple of 50 but beyond the 0x7F code ceiling, so dpi_code
+    refuses it at the codec boundary.
+    """
+    monkeypatch.setattr(compxctl, "read_dpi_slots", _fail_if_device_touched)
+    assert compxctl.main(["dpi", "6500"]) == 1
+    assert compxctl.DPI_VALUE_ERROR_TEXT in capsys.readouterr().err
+
+
+def test_main_catches_unexpected_oserror(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An OSError escaping a command is reported cleanly, never a traceback.
+
+    main() is the last line of defence for transport/evdev OSErrors that a
+    command did not wrap itself.
+    """
+    def boom(args: argparse.Namespace) -> int:
+        raise OSError("backend exploded")
+
+    monkeypatch.setattr(compxctl, "cmd_status", boom)
+    assert compxctl.main([]) == 1
+    err = capsys.readouterr().err
+    assert "Error:" in err
+    assert "backend exploded" in err
+
+
+# ==========================================================================
+# Readout text helpers
+# ==========================================================================
+
+
+def test_battery_text_known_state_appends_link_label() -> None:
+    """A known link state (0x02 = 2.4G mode) gets its bracketed label."""
+    assert (
+        compxctl._battery_text(100, False, 0x02)
+        == "Battery: 100% (not charging) [2.4G mode]"
+    )
+    assert (
+        compxctl._battery_text(42, True, 0x02)
+        == "Battery: 42% (charging) [2.4G mode]"
+    )
+
+
+def test_battery_text_unknown_state_omits_link_label() -> None:
+    """An unrecognised link state adds no bracketed label."""
+    assert (
+        compxctl._battery_text(7, True, 0x7F)
+        == "Battery: 7% (charging)"
+    )
+
+
+def test_slot_value_text_covers_empty_plain_and_extended() -> None:
+    """Slot values render as empty / plain DPI / raw code with mul."""
+    empty = {"x": 0xFF, "y": 0xFF, "mul": 0xFF, "crc": 0xFF, "dpi": None}
+    plain = {"x": 0x13, "y": 0x13, "mul": 0x00, "crc": 0x2F, "dpi": 1000}
+    extended = {"x": 0x7B, "y": 0x7B, "mul": 0x44, "crc": 0x00, "dpi": None}
+    assert compxctl._slot_value_text(empty) == "empty"
+    assert compxctl._slot_value_text(plain) == "1000"
+    assert compxctl._slot_value_text(extended) == "raw:0x7B(mul=0x44)"

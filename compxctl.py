@@ -12,15 +12,17 @@ in _build_battery_request() — this file is the single source of truth.
 Architecture — two transports talk to the same config interface
 (interface 1), layered under one protocol and one set of commands:
 
-* pyusb (raw USB) — always works, because it needs no kernel driver on the
-  interface. `probe` reads through it alone (a SET_REPORT read command,
-  the reply picked off the interrupt-IN endpoint); `set` delivers every
-  rate packet through it; `status` and `battery` read their state with it.
-* hidapi / raw hidraw ioctls — used by `set` as an extra delivery channel
-  per packet, but only while the kernel exposes the config interface as a
-  hidraw node (usage pages FF01-FF04). CompX mice may ship with interface 1
-  unbound and no such node at all, so nothing here requires it; the pyusb
-  path exists precisely for that case.
+* pyusb (raw USB) — needs no kernel driver on the interface, so it is the
+  channel behind `dpi`, `status`, `battery` and `probe` (their reads are a
+  SET_REPORT command whose reply comes back on the interrupt-IN endpoint)
+  and the always-on delivery channel of every `set` rate packet.
+* hidapi / raw hidraw ioctls — `set` and the PID line of `status` require
+  hidapi to be installed: `set` enumerates its control paths through it
+  and, when the kernel binds interface 1 to usbhid (usage pages FF01-FF04),
+  uses each hidraw node as an extra delivery channel per packet. CompX mice
+  may ship with interface 1 unbound and no such node at all; then `set`
+  falls back to the pyusb-only pass, which is why `dpi`, `battery` and
+  `probe` never touch hidapi.
 """
 
 from __future__ import annotations
@@ -284,16 +286,24 @@ def _parse_read_reply(reply: bytes) -> bytes:
     """Extract the payload of a config-memory read reply.
 
     A reply is 09 08 00 AH AL LN + LN payload bytes + 0x00 pad + checksum;
-    LN is byte 5, so the frame itself says how long the payload is. Callers
-    verify the frame first (_verify_frame + header echo) and only then
-    trust the slice.
+    LN is byte 5, so the frame itself says how long the payload is. The
+    parser checks the frame is complete and LN is a sane payload length
+    (1..PROBE_MAX_READ_BYTES — the firmware ceiling), then returns the
+    payload slice. Callers verify the frame first (_verify_frame + header
+    echo) and only then trust the slice.
     """
     if len(reply) != PROBE_FRAME_BYTES:
         raise ValueError(
             f"config read reply must be {PROBE_FRAME_BYTES} bytes, "
             f"got {len(reply)}"
         )
-    return reply[6 : 6 + reply[5]]
+    length = reply[5]
+    if not 1 <= length <= PROBE_MAX_READ_BYTES:
+        raise ValueError(
+            f"config read reply length byte LN must be 1.."
+            f"{PROBE_MAX_READ_BYTES}, got {length}"
+        )
+    return reply[6 : 6 + length]
 
 
 def _eeprom_packet(rate_code: int) -> bytes:
@@ -494,18 +504,24 @@ def _usb_send_report(packet: bytes, report_type: int = 0x02) -> None:
     `report_type` is the wValue high byte: 0x02 (output report) for the
     `set` rate packets, 0x03 (feature report) for the `probe` read command.
     The firmware dispatches on the report payload, so both forms share this
-    one transport path.
+    one transport path. pyusb failures surface as OSError, the transport
+    error type every caller (read_config_register, write_config,
+    read_battery) already wraps.
     """
+    usb_core, _ = _pyusb()
     with _usb_config_device() as usb_dev:
         report_id = packet[0]
-        result = usb_dev.ctrl_transfer(
-            bmRequestType=0x21,
-            bRequest=9,  # SET_REPORT
-            wValue=(report_type << 8) | report_id,
-            wIndex=1,
-            data_or_wLength=packet,
-            timeout=1000,
-        )
+        try:
+            result = usb_dev.ctrl_transfer(
+                bmRequestType=0x21,
+                bRequest=9,  # SET_REPORT
+                wValue=(report_type << 8) | report_id,
+                wIndex=1,
+                data_or_wLength=packet,
+                timeout=1000,
+            )
+        except usb_core.USBError as exc:
+            raise OSError(str(exc)) from exc
         if result != len(packet):
             raise OSError("USB SET_REPORT rejected by the device")
 
@@ -516,8 +532,8 @@ def _usb_read_reply(timeout: int = PROBE_READ_TIMEOUT_MS) -> bytes | None:
     Finds the endpoint exactly like `probe` did historically (first
     interrupt-IN descriptor of the interface) and reads one
     PROBE_FRAME_BYTES frame. Returns None when the device sends no frame
-    within `timeout` ms; any other USB error propagates so the caller can
-    attach context to it.
+    within `timeout` ms; any other USB error propagates as OSError so the
+    caller can attach context to it.
     """
     usb_core, usb_util = _pyusb()
     with _usb_config_device() as usb_dev:
@@ -561,7 +577,7 @@ def _usb_read_reply(timeout: int = PROBE_READ_TIMEOUT_MS) -> bytes | None:
         except usb_core.USBError as exc:
             if exc.errno == errno.ETIMEDOUT:
                 return None  # no frame within `timeout` — the caller decides
-            raise
+            raise OSError(str(exc)) from exc
 
 
 # ==========================================================================
@@ -1063,9 +1079,9 @@ def measure_event_rate_hz(event_path: str, seconds: float = MEASURE_SECONDS) -> 
 
 
 # ==========================================================================
-# Commands — CLI entry points. The behaviour and output of the v1.0.1
-# commands (set/check/probe) are frozen; `status` and `battery` were added
-# in v1.1.0 and are strictly read-only.
+# Commands — CLI entry points. The behaviour and output of `set` and `check`
+# are frozen since v1.0.0; `status`, `battery`, `probe` and `dpi` were added
+# in v1.1.0.
 # ==========================================================================
 
 
@@ -1464,8 +1480,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
         )
     if dpi_notes:
         notes.append(
-            "DPI table 0x000C-0x002B: x/y/mul/crc per slot look like encoded "
-            "DPI (value formula unknown)"
+            "DPI table 0x000C-0x002B: x/y/mul/crc per slot — rows with "
+            "x <= 0x7F and mul = 0 decode via dpi_decode (400..6400); "
+            "extended rows (code > 0x7F or mul != 0) are shown raw"
         )
         notes.extend(dpi_notes)
 
@@ -1596,7 +1613,7 @@ def main(argv: list[str] | None = None) -> int:
     func = args.func if getattr(args, "func", None) else cmd_status
     try:
         return func(args)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
