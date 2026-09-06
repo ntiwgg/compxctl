@@ -89,24 +89,29 @@ EVENT_NOT_FOUND_TEXT = (
 #   2. report 0x08 / sub-report 0x11 (0x08 0x11 ...): applies the interval;
 #      byte 6 = report interval in ms (0x08 -> 125 Hz, 0x02 -> 500 Hz,
 #      0x01 -> 1000 Hz);
-#   3. report 0x08 / sub-report 0x07 (0x08 0x07 ...): EEPROM write of the same
-#      interval so the rate survives unplug / re-plug. The write stores the
-#      interval as the report-interval code (in ms) and ends in a checksum
-#      byte, so it is assembled by _eeprom_packet(), never hardcoded.
+#   3. report 0x08 / sub-report 0x07 (0x08 0x07 ...): EEPROM write so the
+#      rate survives unplug / re-plug. It writes ONLY the rate pair to config
+#      memory at 0x0000 (2-byte payload: interval code + complement), never
+#      the header bytes around it, so the DPI-level count (0x0002) and the
+#      active level index (0x0004) survive. The frame is assembled by
+#      _eeprom_packet(), never hardcoded.
 # The EEPROM write stores the rate as the report-interval code of packet 2's
-# byte 6 (value in ms): 1 ms = 1000 Hz, 2 ms = 500 Hz, 8 ms = 125 Hz.
+# byte 6 (value in ms): 1 ms = 1000 Hz, 2 ms = 500 Hz, 8 ms = 125 Hz. The
+# complement is 0x55 minus the code; a longer write that also stored the four
+# bytes at 0x0002..0x0005 was observed to clobber the DPI-level fields, so
+# the payload must stay exactly the 2-byte pair.
 INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
 
 # CompX config-memory (EEPROM) write frame, 17 bytes — see
 # _build_write_frame() for the generic builder:
 #   [0:3]  0x08 0x07 0x00   report 0x08, write opcode 0x07, reserved
 #   [3:5]  AH AL            write address (big-endian; 0x0000 for the rate)
-#   [5]    LN               payload length (six bytes follow)
-#   [6:12] rate byte        interval code: 0x01 = 1000 Hz, 0x02 = 500 Hz,
+#   [5]    LN               payload length (two bytes follow for the rate write;
+#                           the frame builder accepts any length 1..10)
+#   [6:8]  rate byte        interval code: 0x01 = 1000 Hz, 0x02 = 500 Hz,
 #                           0x08 = 125 Hz (same convention as packet 2, byte 6)
 #          complement       additive complement to 0x55 (0x55 - rate byte)
-#          01 54 00 55      observed fields, fixed across rates
-#   [12:16] 0x00 pad
+#   [8:16] 0x00 pad
 #   [16]   checksum         tail byte such that the sum of all 17 bytes is
 #                          ≡ 0x55 (mod 256) — computed, never hardcoded.
 
@@ -284,23 +289,35 @@ def _eeprom_packet(rate_code: int) -> bytes:
     """Assemble the 17-byte EEPROM persistence packet for `rate_code`.
 
     `rate_code` is the report-interval code the write stores (see
-    INTERVAL_CODE_BY_RATE). The rate byte, its complement and the observed
-    fixed fields form the payload of a plain config-memory write at
-    0x0000, so the frame is delegated to _build_write_frame() and the tail
-    can never drift out of sync with the payload.
+    INTERVAL_CODE_BY_RATE). The rate byte and its complement form the whole
+    2-byte payload of a plain config-memory write at 0x0000, so the frame is
+    delegated to _build_write_frame() and the tail can never drift out of
+    sync with the payload. Keeping the write at 2 bytes (rate pair only)
+    matters: a longer payload would overwrite the neighbouring header fields
+    at 0x0002..0x0005 (DPI-level count and active level index), which is
+    exactly the bug this length avoids.
     """
-    data = bytes((rate_code, 0x55 - rate_code)) + b"\x01\x54\x00\x55"
+    data = bytes((rate_code, 0x55 - rate_code))
     return _build_write_frame(0x0000, data)
 
 
 # Byte-identity reference for _verify_packet_generation(): the packets below
-# were captured from a real mouse while compxctl still carried them as
-# literals (v1.0.1 and earlier). The builder above must reproduce them exactly.
+# are the CURRENT len=2 EEPROM writes (rate pair only at 0x0000) verified on
+# hardware on 2026-09-06 — the mouse accepts them and they no longer clobber
+# the DPI-level fields at 0x0002..0x0005 (0x06 level count, 0x01 active
+# index). The builder above must reproduce them exactly.
 _KNOWN_GOOD_EEPROM_PACKETS: dict[int, bytes] = {
-    125: b"\x08\x07\x00\x00\x00\x06\x08\x4d\x01\x54\x00\x55\x00\x00\x00\x00\x41",
-    500: b"\x08\x07\x00\x00\x00\x06\x02\x53\x01\x54\x00\x55\x00\x00\x00\x00\x41",
-    1000: b"\x08\x07\x00\x00\x00\x06\x01\x54\x01\x54\x00\x55\x00\x00\x00\x00\x41",
+    125: b"\x08\x07\x00\x00\x00\x02\x08\x4d\x00\x00\x00\x00\x00\x00\x00\x00\xef",
+    500: b"\x08\x07\x00\x00\x00\x02\x02\x53\x00\x00\x00\x00\x00\x00\x00\x00\xef",
+    1000: b"\x08\x07\x00\x00\x00\x02\x01\x54\x00\x00\x00\x00\x00\x00\x00\x00\xef",
 }
+# Historical captures (v1.0.1..v1.1.0, len=6): the same writes shipped with a
+# constant 01 54 00 55 tail, overwriting registers 0x0002..0x0005 (DPI level
+# count and active level index) and breaking the mouse's DPI button. They are
+# kept here only for reference — the len=2 packets above replaced them:
+#   125: b"\x08\x07\x00\x00\x00\x06\x08\x4d\x01\x54\x00\x55\x00\x00\x00\x00\x41"
+#   500: b"\x08\x07\x00\x00\x00\x06\x02\x53\x01\x54\x00\x55\x00\x00\x00\x00\x41"
+#   1000: b"\x08\x07\x00\x00\x00\x06\x01\x54\x01\x54\x00\x55\x00\x00\x00\x00\x41"
 
 # Byte-identity reference for _verify_battery_request(): the 08 04 request
 # as captured from a real mouse. The builder above must reproduce it exactly.
@@ -1137,10 +1154,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         index = active_pair[0]
         active_text = f"index 0x{index:02X} (register 0x{ACTIVE_DPI_LEVEL_ADDR:04X})"
         if index == 0:
-            active_text += (
-                " → no level marked (the `set` EEPROM write spans registers "
-                "0x0000..0x0005 and clears this one)"
-            )
+            active_text += " → no level marked (register 0x0004 holds 0x00)"
         else:
             slot_index = index - ACTIVE_LEVEL_OFFSET
             if dpi_slots is not None and 0 <= slot_index < len(dpi_slots):
