@@ -1,69 +1,69 @@
 # compxctl
 
-**One command for CompX / Ardor Gaming mice on Linux: switch the polling rate (125 / 500 / 1000 Hz) and the DPI levels right on the device — through the proprietary HID protocol that only the vendor's Windows software speaks.**
+**Одна команда для мышей CompX / Ardor Gaming в Linux: переключает polling rate (125 / 500 / 1000 Гц) и уровни DPI прямо на устройстве — через проприетарный HID-протокол, которым пользуется только Windows-софт вендора.**
 
-`compxctl` is a single-file Python CLI. It talks to the mouse's configuration interface (USB VID `0x25A7`), changes the polling rate and the DPI on the chip level, and writes the setting to EEPROM so it survives unplugging. A built-in `check` command honestly shows what rate you actually got. No daemon, no GUI, no kernel module. Root is needed once, to install the udev rules.
+`compxctl` — CLI из одного Python-файла. Он общается с конфигурационным интерфейсом мыши (USB VID `0x25A7`), меняет частоту опроса и DPI на уровне чипа и записывает настройку в EEPROM, чтобы она переживала переподключение. Встроенный `check` честно показывает, какая частота получилась на самом деле. Никаких демонов, GUI и модулей ядра. Root нужен один раз — для установки udev-правил.
 
 ```bash
-python3 compxctl.py set 1000   # apply 1000 Hz now; the rate survives re-plug
-python3 compxctl.py check      # verify: move the mouse for ~1.5 s while it measures
+python3 compxctl.py set 1000   # применить 1000 Гц сейчас; частота переживёт переподключение
+python3 compxctl.py check      # проверка: подвигайте мышью ~1,5 секунды
 ```
 
-## History: why this exists
+## История: зачем это появилось
 
-I play CS and moved to Linux. My CompX / Ardor Gaming mouse worked, but its default polling rate was uncomfortable, and the vendor ships its configuration utility for Windows only. There was no ready Linux solution: the options boiled down to living with it or booting Windows for a single setting.
+Я играю в CS и переехал на Linux. Мышь CompX / Ardor Gaming работала, но частота опроса по умолчанию была неудобной, а фирменная утилита вендора существует только под Windows. Готового Linux-решения не было: оставалось терпеть или грузить Windows ради одной настройки.
 
-So I reverse-engineered the mouse's proprietary HID protocol and built `compxctl` — a small CLI that switches the polling rate and the DPI levels right on the device, including an EEPROM write so the setting survives unplugging.
+Поэтому я разобрал проприетарный HID-протокол мыши (реверс-инжиниринг) и сделал `compxctl` — маленькую CLI-утилиту, которая переключает polling rate и уровни DPI прямо на устройстве, включая запись в EEPROM, чтобы настройка переживала отключение.
 
-It was a two-person job: I set the direction, worked out the protocol and verified every step on the real mouse. The code was written and refactored together with an AI assistant.
+Направление задавал я: разбирался в протоколе и проверял каждый шаг на реальной мыши. Код писался и переписывался вместе с ИИ-ассистентом.
 
-Along the way we found a good bug: an early version of the rate write clobbered the mouse's DPI fields (registers `0x0002..0x0005`) and broke the DPI-cycle button. Fixed — the EEPROM write now stores only two bytes at `0x0000` and leaves neighbouring registers alone. The fix is recorded in git as the commit "Preserve DPI level fields…".
+В процессе нашли хороший баг: ранняя версия записи частоты затирала DPI-поля мыши (регистры `0x0002..0x0005`) и ломала кнопку переключения DPI. Исправили — теперь EEPROM-запись пишет только два байта в `0x0000` и не трогает соседние регистры. Фикс зафиксирован в git коммитом «Preserve DPI level fields…».
 
-Over time the tool grew from a one-setting switcher into a small diagnostic utility: it shows device state, DPI levels and battery.
+Со временем утилита выросла из «переключателя одной настройки» в маленький инструмент диагностики: показывает состояние устройства, DPI-уровни и батарею.
 
-## Features
+## Возможности
 
-- `set 125|500|1000` — switch the polling rate and write it to the mouse's EEPROM (the setting survives re-plug);
-- `check` — measure the actual polling rate: keep the mouse moving for ~1.5 s while events are counted;
-- `dpi list` — show the table of all eight DPI slots and the active level;
-- `dpi N` — write a DPI value into the active slot (the write is verified by a readback);
-- `dpi --slot S N` — same, but into an explicit slot `0..5`;
-- `status` — a device snapshot: PID, polling rate, active DPI level, slots, battery;
-- `battery` — charge level and charging state;
-- `probe --start ADDR --length LEN` — dump a window of the config memory and interpret the known fields;
-- `--version` — print the version (`compxctl 1.1.0`).
+- `set 125|500|1000` — переключить polling rate и записать его в EEPROM мыши (настройка переживает переподключение);
+- `check` — замерить фактическую частоту опроса: ~1,5 секунды двигайте мышью, утилита считает события ввода;
+- `dpi list` — показать таблицу всех восьми слотов DPI и активный уровень;
+- `dpi N` — записать DPI в активный слот (запись проверяется чтением назад);
+- `dpi --slot S N` — то же, но в явный слот `0..5`;
+- `status` — снимок устройства: PID, частота, активный DPI-уровень, слоты, батарея;
+- `battery` — уровень заряда и статус зарядки;
+- `probe --start ADDR --length LEN` — дамп окна конфиг-памяти с интерпретацией известных полей;
+- `--version` — версия утилиты (`compxctl 1.1.0`).
 
-Running without a subcommand (`python3 compxctl.py`) is equivalent to `status`.
+Запуск без подкоманды (`python3 compxctl.py`) эквивалентен `status`.
 
-## Quick start
+## Быстрый старт
 
-### Requirements
+### Требования
 
-- Linux and Python ≥ 3.10;
-- the packages from `requirements.txt`;
-- access to the mouse's USB/HID nodes (the udev rules from this repository, installed once).
+- Linux и Python ≥ 3.10;
+- пакеты из `requirements.txt`;
+- права на USB/HID-узлы мыши (udev-правила из репозитория, ставятся один раз).
 
-### Installing dependencies
+### Установка зависимостей
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate   # optional, isolated
+python3 -m venv .venv && source .venv/bin/activate   # опционально, изолированно
 pip install -r requirements.txt
 ```
 
-A note: on Linux `hidapi` often has no ready-made wheel and is built from source — you need a compiler and headers. On Debian/Ubuntu that is roughly `sudo apt install build-essential python3-dev libudev-dev libusb-1.0-0-dev` (pyusb additionally needs libusb).
+Предупреждение: `hidapi` на Linux часто не имеет готового wheel и собирается из исходников — понадобятся компилятор и заголовки. В Debian/Ubuntu это примерно `sudo apt install build-essential python3-dev libudev-dev libusb-1.0-0-dev` (libusb дополнительно нужен pyusb).
 
-Dependency map by command:
+Карта зависимостей по командам:
 
-| Command | Dependencies |
-|---------|--------------|
-| `set` | `hidapi` — hidraw path discovery and packet delivery; `pyusb` — the raw-USB delivery channel (recommended; without it `set` only works when the config interface has a hidraw node, and prints a warning) |
+| Команда | Зависимости |
+|---------|-------------|
+| `set` | `hidapi` — поиск hidraw-путей и доставка пакетов; `pyusb` — raw-USB канал доставки (рекомендуется; без него `set` работает, только если у конфигурационного интерфейса есть hidraw-узел, и печатает warning) |
 | `check` | `evdev` |
 | `dpi`, `battery`, `probe` | `pyusb` |
-| `status` | `pyusb` (all reads) + `hidapi` (the PID line) |
+| `status` | `pyusb` (все чтения) + `hidapi` (строка PID) |
 
-### Access rights (udev)
+### Права доступа (udev)
 
-Running as root works without any udev rules. For regular users, install the access rules once:
+Из-под root утилита работает без правил. Для обычных пользователей один раз:
 
 ```bash
 sudo cp 99-compx-mouse.rules /etc/udev/rules.d/
@@ -71,137 +71,137 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Then unplug and re-plug the mouse (a re-login also works). The rule file grants access:
+Затем переподключите мышь (подойдёт и повторный вход в систему). Правила дают доступ:
 
-| Node type | Access |
-|-----------|--------|
-| `hidraw` (the `set` channel) | group `users`, mode `0660`, plus `TAG+="uaccess"` for the active logind session |
-| `input` (read by `check`) | group `input`, mode `0660`, plus `TAG+="uaccess"` |
-| `usb` device node (pyusb commands) | group `users`, mode `0664` |
+| Тип узла | Доступ |
+|----------|--------|
+| `hidraw` (канал `set`) | группа `users`, режим `0660`, плюс `TAG+="uaccess"` для активной logind-сессии |
+| `input` (читает `check`) | группа `input`, режим `0660`, плюс `TAG+="uaccess"` |
+| `usb`-узел (pyusb-команды) | группа `users`, режим `0664` |
 
-`TAG+="uaccess"` covers a normal desktop session (logind) without extra steps. For SSH sessions or setups without logind, add yourself to the groups and re-login:
+`TAG+="uaccess"` покрывает обычную desktop-сессию (logind) без лишних действий. Для SSH-сессий или систем без logind добавьте себя в группы и перелогиньтесь:
 
 ```bash
 sudo usermod -aG users,input $USER
 ```
 
-The pyusb commands (`dpi`, `status`, `battery`, `probe`) go through the usb device node, which the rule grants to group `users` **without** `uaccess` — in such environments they need group `users` or a one-off run via sudo.
+pyusb-команды (`dpi`, `status`, `battery`, `probe`) ходят через usb-узел, которому правило даёт группу `users` **без** `uaccess` — в таких окружениях им нужна группа `users` или разовый запуск через sudo.
 
-### Verify the install
+### Проверка установки
 
 ```console
 $ python3 compxctl.py --version
 compxctl 1.1.0
 ```
 
-### Make it one keystroke
+### Быстрый переключатель
 
-The tool is a single self-contained file, so it can live anywhere and be aliased. With fish:
+Утилита — один самодостаточный файл, поэтому её можно положить куда угодно и завести алиасы. Для fish:
 
 ```fish
-# ~/.config/fish/config.fish — adjust the path to your copy
+# ~/.config/fish/config.fish — подставьте путь к вашей копии
 alias 1000 'python3 ~/compx-control/compxctl.py set 1000'
 alias 500  'python3 ~/compx-control/compxctl.py set 500'
 alias 125  'python3 ~/compx-control/compxctl.py set 125'
 ```
 
-Restart the shell, then typing `1000` switches the mouse. The same trick works in bash/zsh (use single quotes there).
+Перезапустите шелл — и простой ввод `1000` переключит мышь. Тот же приём работает в bash/zsh (там используйте одинарные кавычки).
 
-## How it works
+## Как это работает
 
-### Which mice are supported
+### Какие мыши поддерживаются
 
-Targets the CompX / Ardor Gaming family on USB vendor ID `0x25A7`:
+Целевое семейство — CompX / Ardor Gaming, USB vendor ID `0x25A7`:
 
-| PID | Hardware | How it shows up on the bus |
-|-----|----------|----------------------------|
-| `0xFA7B` | Wired mouse | Identified as a *Dual Mode Mouse* in `lsusb` |
-| `0xFA7C` | 2.4 GHz receiver dongle | `Areson Technology Corp 2.4G Wireless Receiver` |
-| `0xFA03`, `0xFA93` | Other units of the same family | Recognized by the same VID/PID list |
+| PID | Железо | Как определяется на шине |
+|-----|--------|--------------------------|
+| `0xFA7B` | Проводная мышь | В `lsusb` определяется как *Dual Mode Mouse* |
+| `0xFA7C` | Приёмник 2.4 ГГц (донгл) | `Areson Technology Corp 2.4G Wireless Receiver` |
+| `0xFA03`, `0xFA93` | Другие устройства того же семейства | Распознаются по тому же списку VID/PID |
 
 ```console
 $ lsusb -d 25a7:
 Bus 001 Device 003: ID 25a7:fa7c Areson Technology Corp 2.4G Wireless Receiver
 ```
 
-The protocol was captured and verified on the **Ardor Gaming Ulta** (Compx brand). The remaining PIDs belong to the same family and are handled by the same code path, but were not individually verified.
+Протокол перехвачен и проверен на **Ardor Gaming Ulta** (бренд Compx). Остальные PID относятся к тому же семейству и обслуживаются тем же кодом, но индивидуально не проверялись.
 
-For `check`, the mouse input nodes are found by their fixed by-id names:
+Для `check` узлы ввода мыши находятся по фиксированным by-id-именам:
 
 - `/dev/input/by-id/usb-Compx_2.4G_Wireless_Receiver-event-mouse`
 - `/dev/input/by-id/usb-Compx_2.4G_Dual_Mode_Mouse-event-mouse`
 
-with a sysfs scan of `/dev/input/event*` by vendor/product as a fallback. A specific node can be passed explicitly: `check --device /dev/input/eventN`.
+с запасным вариантом — сканированием `/dev/input/event*` через sysfs по vendor/product. Конкретный узел можно передать явно: `check --device /dev/input/eventN`.
 
-### The protocol: three reports per rate
+### Протокол: три отчёта на частоту
 
-Switching is done on the chip level through the mouse's configuration HID interface (vendor usage pages `0xFF01`–`0xFF04`, with interface #1 as a fallback). Each rate is exactly three reports: the first two apply the rate live, the third writes it to EEPROM so it survives unplug / re-plug.
+Переключение происходит на уровне чипа через конфигурационный HID-интерфейс мыши (vendor usage pages `0xFF01`–`0xFF04`, запасной вариант — интерфейс №1). Каждая частота — ровно три отчёта: первые два применяют частоту «на лету», третий записывает её в EEPROM, чтобы она пережила отключение и повторное подключение.
 
-| Rate | ① live rate — report `0x06` | ② live interval — report `0x08` / `0x11` | ③ persist — report `0x08` / `0x07` |
-|------|------------------------------|------------------------------------------|--------------------------------------|
-| 125 Hz | `06 11 00 00 00 00 00 00` | `08 11 00 00 00 06 08` + zero pad | `08 07 00 00 00 02 08 4D …` |
-| 500 Hz | `06 11 00 01 00 00 00 00` | `08 11 00 00 00 06 02` + zero pad | `08 07 00 00 00 02 02 53 …` |
-| 1000 Hz | `06 11 00 02 00 00 00 00` | `08 11 00 00 00 06 01` + zero pad | `08 07 00 00 00 02 01 54 …` |
+| Частота | ① частота — отчёт `0x06` | ② интервал — отчёт `0x08` / `0x11` | ③ сохранение — отчёт `0x08` / `0x07` |
+|---------|--------------------------|------------------------------------|--------------------------------------|
+| 125 Гц  | `06 11 00 00 00 00 00 00` | `08 11 00 00 00 06 08` + нулевой паддинг | `08 07 00 00 00 02 08 4D …` |
+| 500 Гц  | `06 11 00 01 00 00 00 00` | `08 11 00 00 00 06 02` + нулевой паддинг | `08 07 00 00 00 02 02 53 …` |
+| 1000 Гц | `06 11 00 02 00 00 00 00` | `08 11 00 00 00 06 01` + нулевой паддинг | `08 07 00 00 00 02 01 54 …` |
 
-What the variable bytes mean:
+Что означают переменные байты:
 
-- ① byte 3 of the report (0-based, report id included) is the **rate code**: `0x00` → 125 Hz, `0x01` → 500 Hz, `0x02` → 1000 Hz;
-- ② byte 6 is the **report interval in milliseconds**: `0x08` → 8 ms → 125 Hz, `0x02` → 2 ms → 500 Hz, `0x01` → 1 ms → 1000 Hz;
-- ③ is the **EEPROM write** (see below) — this is what makes the rate stick across unplugging.
+- ① байт 3 отчёта (с нуля, с учётом байта report id) — **код частоты**: `0x00` → 125 Гц, `0x01` → 500 Гц, `0x02` → 1000 Гц;
+- ② байт 6 — **интервал отчёта в миллисекундах**: `0x08` → 8 мс → 125 Гц, `0x02` → 2 мс → 500 Гц, `0x01` → 1 мс → 1000 Гц;
+- ③ — **запись в EEPROM** (см. ниже), именно она делает частоту «липкой» при отключении питания.
 
-The whole table lives in one place in the code — `POLLING_VARIANTS`, with the EEPROM frames built by `_eeprom_packet()` — so the protocol definition has a single source of truth.
+Вся таблица живёт в одном месте кода — `POLLING_VARIANTS`, а EEPROM-кадры собирает `_eeprom_packet()`: у определения протокола единственный источник истины.
 
-### EEPROM write: two bytes at `0x0000`, the frame sums to `0x55`
+### EEPROM-запись: два байта в `0x0000`, кадр сходится в `0x55`
 
-The third packet is **not** replayed from a capture — it is assembled programmatically as an ordinary 17-byte config-memory write frame. Exactly **2 bytes** are written at address `0x0000`: the interval code (the same as packet ② byte 6) and its additive complement to `0x55`. Then comes zero padding and the final checksum byte: the sum of all 17 frame bytes must be `≡ 0x55 (mod 256)`. The checksum is computed, never taken from a capture.
+Третий пакет **не** реплеится из захвата — он собирается программно как обычный 17-байтовый кадр записи конфиг-памяти. В адрес `0x0000` пишется ровно **2 байта**: код интервала (тот же, что в байте 6 пакета ②) и его аддитивное дополнение до `0x55`. Дальше — нулевой паддинг и последний байт-контрольная сумма: сумма всех 17 байт кадра должна быть `≡ 0x55 (mod 256)`. Контрольная сумма вычисляется, а не берётся из захвата.
 
-| Rate | Full EEPROM packet (17 bytes) |
-|------|-------------------------------|
-| 125 Hz | `08 07 00 00 00 02 08 4D 00 00 00 00 00 00 00 00 EF` |
-| 500 Hz | `08 07 00 00 00 02 02 53 00 00 00 00 00 00 00 00 EF` |
-| 1000 Hz | `08 07 00 00 00 02 01 54 00 00 00 00 00 00 00 00 EF` |
+| Частота | Полный EEPROM-пакет (17 байт) |
+|---------|-------------------------------|
+| 125 Гц  | `08 07 00 00 00 02 08 4D 00 00 00 00 00 00 00 00 EF` |
+| 500 Гц  | `08 07 00 00 00 02 02 53 00 00 00 00 00 00 00 00 EF` |
+| 1000 Гц | `08 07 00 00 00 02 01 54 00 00 00 00 00 00 00 00 EF` |
 
-Here `08 07` is report `0x08` with write opcode `0x07`, then the address `00 00`, length `02`, the code + complement pair, and the `EF` tail. The built frames are checked against known-good captures in the self-check mode (`COMPX_SELFCHECK=1`).
+Здесь `08 07` — отчёт `0x08` и опкод записи `0x07`, дальше адрес `00 00`, длина `02`, байты «код + дополнение» и хвост `EF`. Собранные кадры сверяются с эталонными в самопроверочном режиме (`COMPX_SELFCHECK=1`).
 
-Why exactly 2 bytes — that is the story of a bug. An early version appended a captured "tail" to the rate, and the write spilled into registers `0x0002..0x0005` (the DPI-level count and the active level index): the mouse lost its DPI settings and the DPI-cycle button broke. Now only the code + complement pair is written and the neighbouring fields are left alone. The fix is recorded in git (commit "Preserve DPI level fields…").
+Почему длина строго 2 байта — это история одного бага. Ранняя версия дописывала к частоте перехваченный «хвост», и запись задевала регистры `0x0002..0x0005` (число DPI-уровней и активный индекс): мышь теряла DPI-настройки, а кнопка переключения DPI ломалась. Сейчас пишется только пара «код + дополнение», и соседние поля не трогаются. Фикс зафиксирован в git (коммит «Preserve DPI level fields…»).
 
-### Config-memory register map
+### Карта регистров конфиг-памяти
 
-| Address | Contents |
-|---------|----------|
-| `0x0000` | polling-rate code + complement (e.g. `01 54` = 1000 Hz) |
-| `0x0002` | number of DPI levels |
-| `0x0004` | active DPI level index + complement at `0x0005`; treated as 1-based (see limitations) |
-| `0x000C`–`0x002B` | eight DPI slots, 4 bytes each: `x y mul crc` |
-| `0x0060`–`0x009F` | button matrix and similar; past `0x00A0` the memory is empty (`0xFF`) |
+| Адрес | Содержимое |
+|-------|------------|
+| `0x0000` | код polling rate + дополнение (например `01 54` = 1000 Гц) |
+| `0x0002` | число DPI-уровней |
+| `0x0004` | индекс активного DPI-уровня + дополнение в `0x0005`; трактуется как 1-based (см. ограничения) |
+| `0x000C`–`0x002B` | восемь слотов DPI, по 4 байта: `x y mul crc` |
+| `0x0060`–`0x009F` | кнопочная матрица и т. п.; после `0x00A0` память пустая (`0xFF`) |
 
-### The DPI codec
+### DPI-кодек
 
-The mouse stores a code, not the DPI value itself: `code = DPI / 50 − 1`. So 400 → `0x07`, 800 → `0x0F`, 1000 → `0x13`, 1600 → `0x1F`, …, 6400 → `0x7F`. A DPI slot is 4 bytes: for the plain encoding `x = y = code`, `mul = 0`, `crc = 0x55 − x − y − mul` (an example slot row: `13 13 00 2F` = 1000 DPI).
+Мышь хранит не само значение DPI, а код: `код = DPI / 50 − 1`. Поэтому 400 → `0x07`, 800 → `0x0F`, 1000 → `0x13`, 1600 → `0x1F`, …, 6400 → `0x7F`. Слот DPI — это 4 байта: для обычной кодировки `x = y = код`, `mul = 0`, `crc = 0x55 − x − y − mul` (пример строки слота: `13 13 00 2F` = 1000 DPI).
 
-Slots `0..5` hold the plain encoding and are writable. Slots `6..7` on the verified mouse hold an extended encoding (`code > 0x7F` or `mul ≠ 0`) that is not understood yet: `dpi list` and `status` show them as raw bytes, and `dpi` never overwrites them.
+Слоты `0..5` хранят обычную кодировку и доступны для записи. Слоты `6..7` на проверенной мыши хранят расширенную кодировку (`код > 0x7F` или `mul ≠ 0`), которая пока не расшифрована: `dpi list` и `status` показывают их сырыми байтами, а `dpi` их никогда не перезаписывает.
 
-A DPI write goes to the active slot (per register `0x0004`) or to an explicit slot via `--slot`, and is immediately verified by reading back: without the readback echo the command fails.
+Запись DPI идёт в активный слот (по регистру `0x0004`) или в явный слот через `--slot` и сразу проверяется чтением назад: без подтверждения readback команда завершается ошибкой.
 
-### Delivery and what "success" means
+### Доставка и что значит «успех»
 
-The mouse never acknowledges a report, and the config interface is finicky about kernel-driver ownership. So each of the three `set` packets is sent over several independent channels:
+Мышь никогда не подтверждает приём отчёта, а конфигурационный интерфейс капризен в вопросах владения драйвером ядра. Поэтому каждый из трёх пакетов `set` отправляется по нескольким независимым каналам:
 
-1. **raw-USB SET_REPORT** (pyusb/libusb) to interface 1 — with the kernel driver detached for the transfer and re-attached right after;
-2. **hidapi** — `send_feature_report` first, then a plain output `write` on the same handle;
-3. **raw hidraw ioctl** — `HIDIOCSFEATURE` / `HIDIOCSOUTPUT` as the last-resort path around hidapi.
+1. **raw-USB SET_REPORT** (pyusb/libusb) на интерфейс 1 — с отсоединением драйвера ядра на время передачи и немедленным возвратом;
+2. **hidapi** — `send_feature_report`, затем обычный output `write` на том же дескрипторе;
+3. **сырой hidraw ioctl** — `HIDIOCSFEATURE` / `HIDIOCSOUTPUT` как последний запасной путь в обход hidapi.
 
-Success is counted per **distinct** packet, not per delivery: a packet delivered by more than one channel still counts once. A rate change counts as successful once **at least 2 of the 3 distinct packets** were delivered (the `Packets delivered: N/3 distinct (minimum for success: 2)` line). If several supported devices are connected, every control path found gets the new rate.
+Успех считается по **различным** пакетам, а не по доставкам: пакет, дошедший несколькими каналами, всё равно входит в счёт один раз. Смена частоты считается успешной, когда доставлено **не менее 2 из 3 различных пакетов** (строка `Packets delivered: N/3 distinct (minimum for success: 2)`). Если подключено несколько поддерживаемых устройств, новый режим получает каждый найденный управляющий путь.
 
-Honest caveat: the device sends no acknowledgement. "Success" means the packets were delivered, not that the chip confirmed them — that is exactly what `check` is for.
+Честная оговорка: устройство не шлёт подтверждений. «Успех» означает, что пакеты доставлены, а не что чип их подтвердил, — именно для этого нужна команда `check`.
 
-### What `check` measures
+### Что замеряет `check`
 
-`check` does not talk to the chip. It opens the mouse's input node and counts relative-motion events (`EV_REL`) for ~1.5 seconds while you move the mouse. The rate is the event count divided by the window — a practical, honest verification, not a lab instrument. If the mouse stays still you get an honest `~0 Hz` (and that still counts as a successful run, exit code `0`).
+`check` не разговаривает с чипом. Он открывает узел ввода мыши и считает события относительного движения (`EV_REL`) в течение ~1,5 секунды, пока вы шевелите мышью. Частота — это количество событий, делённое на окно замера: практическая, честная проверка, а не лабораторный прибор. Если мышь стоит на месте, будет честный `~0 Hz` (и это тоже успешный запуск, код `0`).
 
-## Example output
+## Примеры вывода
 
-The program prints in English; the snippets below are its real lines. Slot, PID and battery values in the examples are illustrative.
+Утилита печатает на английском; ниже — реальные строки программы. Значения слотов, PID и батареи в примерах иллюстративные.
 
 ```console
 $ python3 compxctl.py --version
@@ -214,9 +214,9 @@ Packets delivered: 3/3 distinct (minimum for success: 2)
 EEPROM write: done
 ```
 
-- `Rate` — what you asked for; `PID` — the product id found on the bus;
-- `Packets delivered` — how many distinct packets of the three reached the device (a packet delivered over several channels counts once); success starts at `2/3`;
-- `EEPROM write` — `done` when the persistence report went through; `not confirmed (rate may reset after re-plug)` when it did not.
+- `Rate` — запрошенная частота; `PID` — идентификатор устройства на шине;
+- `Packets delivered` — сколько различных пакетов из трёх дошло (пакет, прошедший несколькими каналами, считается один раз); успех — от `2/3`;
+- `EEPROM write` — `done`, когда пакет сохранения ушёл; `not confirmed (rate may reset after re-plug)`, если нет.
 
 ```console
 $ python3 compxctl.py check
@@ -225,7 +225,7 @@ Move the mouse… measuring for ~1.5 s
 Measured rate: ~1000 Hz
 ```
 
-If the mouse was idle:
+Если мышь не двигалась:
 
 ```console
 $ python3 compxctl.py check
@@ -269,43 +269,43 @@ Interpretation:
   polling rate code at 0x0000: 0x01 = 1000 Hz
 ```
 
-`dpi 2400` writes to the active slot, `dpi --slot 3 2400` to an explicit slot. The `updated, verified` line means the write was confirmed by reading back.
+`dpi 2400` пишет в активный слот, `dpi --slot 3 2400` — в явный слот 3. Строка `updated, verified` означает, что запись подтверждена чтением назад.
 
-## Exit codes
+## Коды возврата
 
-| Code | Meaning |
-|------|---------|
-| `0` | success — including a legitimate `~0 Hz` measurement in `check` |
-| `1` | a runtime error — device not found, permission problem, rejected packets, no config-memory reply |
-| `2` | command-line argument error (argparse): unknown command, invalid value, nonexistent `--slot` |
-| `130` | interrupted with Ctrl+C |
+| Код | Значение |
+|-----|----------|
+| `0` | успех — включая легитимный замер `~0 Hz` в `check` |
+| `1` | ошибка выполнения — устройство не найдено, нет прав, пакеты отвергнуты, нет ответа от конфиг-памяти |
+| `2` | ошибка аргументов командной строки (argparse): неизвестная команда, неверное значение, несуществующий слот `--slot` |
+| `130` | прервано по Ctrl+C |
 
-## Troubleshooting
+## Нештатные ситуации
 
-| Symptom (as printed) | Likely cause | Fix |
-|----------------------|--------------|-----|
-| `Error: No CompX mouse found (VID 0x25A7). Check the USB connection: lsusb -d 25a7:` | Mouse not connected or not enumerated | Run `lsusb -d 25a7:`; re-plug the mouse / reseat the receiver; try another USB port |
-| `No access to the HID device. Reinstall the udev rules (99-compx-mouse.rules) and re-plug the mouse.` | Missing/stale udev rules or group membership (the `set` side) | Re-run the udev install, re-plug the mouse, check the `users` and `input` groups, re-login |
-| `Error: Cannot claim the CompX config interface (interface 1): … Access denied …` | No access to the usb device node (pyusb commands) | Reinstall the udev rules, add yourself to group `users` and re-login; a one-off `sudo python3 compxctl.py …` rules out permissions |
-| `Error: The 'usb' package (pyusb) is missing — it is required for this command. Install it with: pip install pyusb` | pyusb is not installed (needed by `dpi`/`status`/`battery`/`probe` and the raw-USB `set` channel) | `pip install pyusb`; make sure libusb is present on the system |
-| `Error: The 'hid' package (hidapi) is missing — it is required for 'set'. Install it with: pip install hidapi` | hidapi is not installed (needed by `set` and the PID line of `status`) | `pip install hidapi` |
-| `No read access to /dev/input/…` on `check` | Missing `input` group / no `uaccess` for the session | `sudo usermod -aG input $USER` + re-login; check the rules carry `TAG+="uaccess"` |
-| `Measured rate: ~0 Hz (no mouse movement detected during the window)` | The mouse was idle during the measurement | Re-run `check` and keep moving the mouse for the whole ~1.5 s |
-| `Error: the device rejected the polling-rate packets` + indented transport lines | Every transport failed | Read the indented lines — each names its transport (`usb:`, `feature:`, `output:`, …); try `sudo python3 compxctl.py set …` once to rule out permissions; re-plug and retry |
+| Симптом (как печатает программа) | Вероятная причина | Решение |
+|----------------------------------|-------------------|---------|
+| `Error: No CompX mouse found (VID 0x25A7). Check the USB connection: lsusb -d 25a7:` | Мышь не подключена или не определилась | Выполните `lsusb -d 25a7:`; переподключите мышь / переставьте приёмник; попробуйте другой USB-порт |
+| `No access to the HID device. Reinstall the udev rules (99-compx-mouse.rules) and re-plug the mouse.` | Отсутствуют или устарели udev-правила либо членство в группах (сторона `set`) | Повторите установку udev-правил, переподключите мышь, проверьте группы `users` и `input`, перелогиньтесь |
+| `Error: Cannot claim the CompX config interface (interface 1): … Access denied …` | Нет доступа к usb-узлу устройства (pyusb-команды) | Установите/переустановите udev-правила, добавьте себя в группу `users` и перелогиньтесь; разовый `sudo python3 compxctl.py …` исключит вопросы прав |
+| `Error: The 'usb' package (pyusb) is missing — it is required for this command. Install it with: pip install pyusb` | Не установлен pyusb (нужен `dpi`/`status`/`battery`/`probe` и raw-USB-канал `set`) | `pip install pyusb`; проверьте, что в системе есть libusb |
+| `Error: The 'hid' package (hidapi) is missing — it is required for 'set'. Install it with: pip install hidapi` | Не установлен hidapi (нужен `set` и строка PID в `status`) | `pip install hidapi` |
+| `No read access to /dev/input/…` в `check` | Нет группы `input` / нет `uaccess` для сессии | `sudo usermod -aG input $USER` + повторный вход; проверьте `TAG+="uaccess"` в правилах |
+| `Measured rate: ~0 Hz (no mouse movement detected during the window)` | Мышь не двигалась во время замера | Запустите `check` ещё раз и шевелите мышью все ~1,5 секунды |
+| `Error: the device rejected the polling-rate packets` + строки каналов с отступом | Не сработал ни один канал | Читайте строки с отступом — каждая называет свой канал (`usb:`, `feature:`, `output:`, …); один раз попробуйте `sudo python3 compxctl.py set …`, чтобы исключить права; переподключите мышь и повторите |
 
-## Known limitations
+## Известные ограничения
 
-- **Vendor-locked by design.** Only VID `0x25A7` with the listed PIDs is ever touched — which also means other mice are completely safe from it.
-- **Experimental protocol.** It was captured on one device (Ardor Gaming Ulta, Compx branding). Sibling PIDs are handled identically but were not individually verified; a future firmware revision could change the reports.
-- **No acknowledgement from the device.** Success means the packets were delivered; treat `check` as the ground truth.
-- **EEPROM write on every `set`.** The persistence report rewrites the mouse's EEPROM on each run. Endurance is finite, but for a setting changed a few times a day this is a non-issue.
-- **`check` is a practical estimate**, not a lab measurement: ~1.5 s window, human-driven movement.
-- **The extended DPI encoding of slots 6–7 is not understood.** Slots 6 and 7 on the verified mouse hold a non-standard encoding: `dpi list`/`status` show them as raw bytes, and `dpi` never overwrites them.
-- **The active-index semantics are "pending calibration".** The index at `0x0004` is treated as 1-based (`ACTIVE_LEVEL_OFFSET`); the exact meaning of the field is not fully confirmed.
+- **Привязан к вендору по дизайну.** Затрагиваются только устройства VID `0x25A7` из списка PID — а значит, другие мыши для него полностью безопасны.
+- **Экспериментальный протокол.** Перехвачен на одном устройстве (Ardor Gaming Ulta, бренд Compx). Соседние PID обслуживаются одинаково, но индивидуально не проверялись; будущая ревизия прошивки может изменить отчёты.
+- **Нет подтверждений от устройства.** Успех означает доставку пакетов; за истину принимайте `check`.
+- **Запись в EEPROM при каждом `set`.** Пакет сохранения переписывает EEPROM мыши на каждом запуске. Ресурс записи конечен, но при переключении несколько раз в день это некритично.
+- **`check` — практическая оценка**, а не лабораторный замер: окно ~1,5 секунды, движение задаёт человек.
+- **Расширенная кодировка DPI слотов 6–7 не расшифрована.** Слоты 6 и 7 на проверенной мыши хранят нестандартную кодировку: `dpi list`/`status` показывают их сырыми байтами, а `dpi` никогда не перезаписывает.
+- **Семантика активного индекса — «pending calibration».** Индекс в `0x0004` трактуется как 1-based (`ACTIVE_LEVEL_OFFSET`); точный смысл поля до конца не подтверждён.
 
-## License
+## Лицензия
 
-There is no LICENSE file yet. This is an unofficial reverse-engineering project. Not affiliated with, endorsed by, or supported by CompX, Ardor Gaming, Areson Technology, or their distributors. The protocol was obtained experimentally and is used at your own risk; the tool comes with no warranty.
+Отдельного LICENSE-файла пока нет. Проект — неофициальный реверс-инжиниринг, не аффилирован с CompX, Ardor Gaming, Areson Technology или их дистрибьюторами и не одобрен ими. Протокол получен экспериментальным путём; использование — на ваш страх и риск; инструмент поставляется без каких-либо гарантий.
 
 
 
