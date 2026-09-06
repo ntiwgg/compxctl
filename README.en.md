@@ -173,7 +173,9 @@ Why exactly 2 bytes — that is the story of a bug. An early version appended a 
 | `0x0002` | number of DPI levels |
 | `0x0004` | active DPI level index + complement at `0x0005`; treated as 1-based (see limitations) |
 | `0x000C`–`0x002B` | eight DPI slots, 4 bytes each: `x y mul crc` |
-| `0x0060`–`0x009F` | button matrix and similar; past `0x00A0` the memory is empty (`0xFF`) |
+| `0x0060`–`0x009F` | button matrix and similar; the RGB-backlight area starts at `0x00A0` (see below), past it the memory is empty (`0xFF`) |
+
+The main RGB backlight is a main-RGB write at `0x00A0` in the form `effect/rgb/speed/brightness/ck`. Effect codes differ between firmware revisions: on the verified unit `0x00` = colour cycle, `0x07` = strobe, `0x08` = off. The utility has no `led` command yet, but the region is readable through `probe`.
 
 ### The DPI codec
 
@@ -245,15 +247,15 @@ Battery: 100% (not charging) [2.4G mode]
 
 $ python3 compxctl.py dpi list
 DPI slots (register 0x0004 = active level index; '*' marks the active slot):
-  slot  addr   x    y    mul  crc   value
-  *0    0x000C 13   13   00   2F    1000
-   1    0x0010 1F   1F   00   17    1600
-   2    0x0014 3F   3F   00   D7    3200
-   3    0x0018 07   07   00   47    400
-   4    0x001C 7F   7F   00   57    6400
-   5    0x0020 FF   FF   FF   FF    empty
-   6    0x0024 FF   FF   FF   FF    empty
-   7    0x0028 FF   FF   FF   FF    empty
+  slot  addr    x    y    mul  crc   value
+  *0    0x000C  13   13   00   2F    1000
+   1    0x0010  1F   1F   00   17    1600
+   2    0x0014  3F   3F   00   D7    3200
+   3    0x0018  07   07   00   47    400
+   4    0x001C  7F   7F   00   57    6400
+   5    0x0020  FF   FF   FF   FF    empty
+   6    0x0024  FF   FF   FF   FF    empty
+   7    0x0028  FF   FF   FF   FF    empty
 Active DPI level: slot 0 (index 0x01) → 1000
 
 $ python3 compxctl.py dpi 2400
@@ -276,8 +278,8 @@ Interpretation:
 | Code | Meaning |
 |------|---------|
 | `0` | success — including a legitimate `~0 Hz` measurement in `check` |
-| `1` | a runtime error — device not found, permission problem, rejected packets, no config-memory reply |
-| `2` | command-line argument error (argparse): unknown command, invalid value, nonexistent `--slot` |
+| `1` | a runtime error — device not found, permission problem, rejected packets, no config-memory reply; also the `dpi` runtime checks: a `--slot` outside `0..5`, a DPI outside 50–6400 or not a multiple of 50 |
+| `2` | a command-line argument error (argparse): unknown command, non-numeric DPI, a rate outside 125/500/1000 for `set` |
 | `130` | interrupted with Ctrl+C |
 
 ## Troubleshooting

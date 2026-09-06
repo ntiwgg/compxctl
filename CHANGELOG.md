@@ -5,15 +5,6 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-- `pyproject.toml` with the `compxctl` console script (`pip install .`).
-- Unit tests (`tests/`) and GitHub Actions CI.
-- `install.sh` — one-shot setup of udev rules and fish completions, with an
-  optional `--with-venv` Python install and `--uninstall`.
-- Fish shell completions (`completions/compxctl.fish`).
-
 ## [1.1.0] — 2026-09-06
 
 ### Added
@@ -22,12 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `dpi` command to list the DPI slots and write a slot's DPI
   (`dpi list`, `dpi N`, `dpi --slot S N`).
 - Computed CompX EEPROM packet checksums (whole frame sums to `0x55`).
-- Documented protocol findings: config-memory map and the LED-effect register
-  (`0x08` = off).
+- `pyproject.toml` with the `compxctl` console script (`pip install .`).
+- Unit tests (`tests/`) and GitHub Actions CI.
+- `install.sh` — one-shot setup of udev rules and fish completions, with an
+  optional `--with-venv` Python install and `--uninstall`.
+- Fish shell completions (`completions/compxctl.fish`).
+- Documented protocol findings: config-memory map; the main-RGB backlight
+  write at `0x00A0` (device-specific: `0x08` = off on the verified unit; the
+  vendor software sends `0x07`, which this firmware treats as strobe).
 
 ### Fixed
 - `set` no longer clobbers the DPI-level fields — the EEPROM write now stores
   only two bytes at `0x0000`.
+- USB error-handling hardening and stale-comment cleanup (review fixes).
 
 ### Changed
 - Unified USB/hidraw transport under protocol primitives.
