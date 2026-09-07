@@ -36,6 +36,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 __version__ = "1.1.0"
@@ -744,63 +745,103 @@ def get_active_product_id() -> int | None:
     return None
 
 
+def _read_config_reply(
+    *,
+    send: Callable[[], None],
+    read: Callable[[], bytes | None],
+    parse: Callable[[bytes], object],
+    timeout_message: str,
+    reject_reason: Callable[[bytes], str | None],
+) -> object:
+    """Send a config command and read its reply with stale-frame drain.
+
+    A received frame that fails header-echo or checksum validation is a stale
+    frame left over by an earlier write (the mouse acks writes on the same
+    interrupt-IN endpoint); it is drained by this read and the command is
+    retried. A read timeout is NOT retried: the reply may arrive late, and a
+    second read would steal it. `send` and `read` translate transport
+    failures into RuntimeError, which is never retried. `reject_reason`
+    returns why a frame was treated as stale — its text is attached to the
+    final RuntimeError after READ_ATTEMPTS — or None when the frame is the
+    genuine reply that `parse` should turn into the return value.
+    """
+    last_detail = timeout_message
+    for _ in range(READ_ATTEMPTS):
+        send()
+        reply = read()
+        if reply is None:
+            raise RuntimeError(timeout_message)
+        reason = reject_reason(reply)
+        if reason is None:
+            return parse(reply)
+        last_detail = reason
+    raise RuntimeError(
+        f"{last_detail} (retried {READ_ATTEMPTS} times after stale frames; "
+        "is another program writing to the mouse?)"
+    )
+
+
 def read_config_register(addr: int, length: int) -> bytes:
     """Read `length` config-memory bytes at `addr` via the raw-USB channel.
 
     Sends the read frame as a feature SET_REPORT and picks the reply off the
-    interrupt-IN endpoint. The reply echoes AH/AL/LN and must sum to 0x55,
-    so both are verified before the payload is trusted. A received frame
-    that fails verification was probably a stale write-ack queued by a
-    recent `set` burst — it is drained by this read, so the read is retried
-    (READ_ATTEMPTS times) before raising RuntimeError with the failing
-    address attached. Timeouts and transport errors are not retried.
+    interrupt-IN endpoint, through the shared _read_config_reply() drain
+    loop. The reply echoes AH/AL/LN and must sum to 0x55, so both are
+    verified before the payload is trusted; a frame that fails verification
+    was probably a stale write-ack queued by a recent `set` burst and is
+    drained, with the read retried (READ_ATTEMPTS times) before RuntimeError
+    is raised with the failing register attached. Timeouts and transport
+    errors are not retried.
     """
     command = _build_read_frame(addr, length)
-    last_detail = f"No config-memory reply from the device for 0x{addr:04X}"
-    for _ in range(READ_ATTEMPTS):
+    register = f"0x{addr:04X}"
+
+    def send() -> None:
         try:
             _usb_send_report(command, report_type=0x03)  # feature report 0x0308
         except OSError as exc:
             raise RuntimeError(
                 f"USB SET_REPORT failed while reading config memory at "
-                f"0x{addr:04X}: {exc}"
+                f"{register}: {exc}"
             ) from exc
 
+    def read() -> bytes | None:
         try:
-            reply = _usb_read_reply()
+            return _usb_read_reply()
         except OSError as exc:
             raise RuntimeError(
-                f"No config-memory reply from the device for 0x{addr:04X} "
+                f"No config-memory reply from the device for {register} "
                 f"(interrupt-IN read: {exc})"
             ) from exc
-        if reply is None:
-            raise RuntimeError(
-                f"No config-memory reply from the device for 0x{addr:04X} "
-                f"(interrupt-IN read timed out)"
-            )
+
+    def reject_reason(reply: bytes) -> str | None:
         if len(reply) != PROBE_FRAME_BYTES:
-            last_detail = (
-                f"Short config-memory reply for 0x{addr:04X}: got "
+            return (
+                f"Short config-memory reply for {register}: got "
                 f"{len(reply)} bytes, expected {PROBE_FRAME_BYTES}"
             )
-            continue
         if reply[3:6] != command[3:6]:
-            last_detail = (
-                f"Config-memory reply header mismatch for 0x{addr:04X}: "
+            return (
+                f"Config-memory reply header mismatch for {register}: "
                 f"echo AH/AL/LN = {reply[3:6].hex(' ')} "
                 f"(expected {command[3:6].hex(' ')}) — stale reply?"
             )
-            continue
         if not _verify_frame(reply):
-            last_detail = (
-                f"Config-memory reply checksum mismatch for 0x{addr:04X}: "
+            return (
+                f"Config-memory reply checksum mismatch for {register}: "
                 "frame does not sum to 0x55"
             )
-            continue
-        return _parse_read_reply(reply)
-    raise RuntimeError(
-        f"{last_detail} (retried {READ_ATTEMPTS} times after stale frames; "
-        "is another program writing to the mouse?)"
+        return None
+
+    return _read_config_reply(
+        send=send,
+        read=read,
+        parse=_parse_read_reply,
+        timeout_message=(
+            f"No config-memory reply from the device for {register} "
+            "(interrupt-IN read timed out)"
+        ),
+        reject_reason=reject_reason,
     )
 
 
@@ -886,14 +927,14 @@ def read_battery() -> tuple[int, bool, int]:
     Sends the 17-byte 08 04 battery request (_build_battery_request()) as
     an output SET_REPORT and picks the 09 04 echo reply off the
     interrupt-IN endpoint (reply[5] = link state, reply[6] = percent,
-    reply[7] = charging flag). A received frame that fails verification was
-    probably a stale write-ack queued by a recent `set` burst — it is
-    drained by this read, so the request is retried (READ_ATTEMPTS times)
-    before RuntimeError is raised. Timeouts ("no battery reply") are not
-    retried: a late reply must not be doubled.
+    reply[7] = charging flag), through the shared _read_config_reply() drain
+    loop. A received frame that fails verification was probably a stale
+    write-ack queued by a recent `set` burst — it is drained by this read,
+    so the request is retried (READ_ATTEMPTS times) before RuntimeError is
+    raised. Timeouts ("no battery reply") are not retried: a late reply must
+    not be doubled.
     """
-    last_detail = "no battery reply"
-    for _ in range(READ_ATTEMPTS):
+    def send() -> None:
         try:
             _usb_send_report(_build_battery_request())
         except OSError as exc:
@@ -901,28 +942,30 @@ def read_battery() -> tuple[int, bool, int]:
                 f"USB SET_REPORT failed while requesting the battery state: {exc}"
             ) from exc
 
+    def read() -> bytes | None:
         try:
-            reply = _usb_read_reply()
+            return _usb_read_reply()
         except OSError as exc:
             raise RuntimeError(f"Battery reply could not be read: {exc}") from exc
-        if reply is None:
-            raise RuntimeError("no battery reply")
+
+    def reject_reason(reply: bytes) -> str | None:
         if len(reply) != PROBE_FRAME_BYTES:
-            last_detail = "no battery reply"
-            continue
+            return "no battery reply"
         if reply[:2] != BATTERY_REPLY_ECHO:
-            last_detail = (
+            return (
                 f"Battery reply header mismatch: {reply[:2].hex(' ')} != "
                 f"{BATTERY_REPLY_ECHO.hex(' ')} — stale reply?"
             )
-            continue
         if not _verify_frame(reply):
-            last_detail = "Battery reply checksum mismatch: frame does not sum to 0x55"
-            continue
-        return reply[6], bool(reply[7]), reply[5]
-    raise RuntimeError(
-        f"{last_detail} (retried {READ_ATTEMPTS} times after stale frames; "
-        "is another program writing to the mouse?)"
+            return "Battery reply checksum mismatch: frame does not sum to 0x55"
+        return None
+
+    return _read_config_reply(
+        send=send,
+        read=read,
+        parse=lambda reply: (reply[6], bool(reply[7]), reply[5]),
+        timeout_message="no battery reply",
+        reject_reason=reject_reason,
     )
 
 
@@ -1133,6 +1176,22 @@ def _battery_text(percent: int, charging: bool, state: int) -> str:
     return text
 
 
+def _read_field(
+    warnings: list[str], label: str, reader: Callable[[], object]
+) -> object:
+    """Read one `status` field, degrading a RuntimeError into a warning.
+
+    Returns the reader's value, or None when the read raised RuntimeError:
+    that field then prints as n/a and its failure text is recorded in
+    `warnings` as "<label>: <exc>" for the trailing warning lines.
+    """
+    try:
+        return reader()
+    except RuntimeError as exc:
+        warnings.append(f"{label}: {exc}")
+        return None
+
+
 def cmd_status(_args: argparse.Namespace) -> int:
     """`status` entry point: read-only device snapshot.
 
@@ -1148,89 +1207,68 @@ def cmd_status(_args: argparse.Namespace) -> int:
         raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
 
     warnings: list[str] = []
-    ok_fields = 0
+    unknown_hz = object()  # the read succeeded, but the rate code is unmapped
+    battery = _read_field(warnings, "battery", read_battery)
+    hz = _read_field(
+        warnings, "polling rate", lambda: read_polling_rate_hz() or unknown_hz
+    )
+    slots = _read_field(warnings, "DPI slots", read_dpi_slots)
+    active_pair = _read_field(warnings, "active DPI level", read_active_dpi_level)
 
-    def warn(field: str, exc: BaseException) -> None:
-        warnings.append(f"{field}: {exc}")
-
-    battery_text = "Battery: n/a"
-    try:
-        percent, charging, state = read_battery()
-    except RuntimeError as exc:
-        warn("battery", exc)
-    else:
-        battery_text = _battery_text(percent, charging, state)
-        ok_fields += 1
-
-    polling_text = "n/a"
-    try:
-        hz = read_polling_rate_hz()
-    except RuntimeError as exc:
-        warn("polling rate", exc)
-    else:
-        ok_fields += 1
-        if hz is not None:
-            polling_text = f"{hz} Hz (register 0x{PROBE_POLLING_ADDR:04X})"
-        else:
-            polling_text = f"unknown code (register 0x{PROBE_POLLING_ADDR:04X})"
-
-    dpi_slots: list[dict] | None = None
-    try:
-        dpi_slots = read_dpi_slots()
-    except RuntimeError as exc:
-        warn("DPI slots", exc)
-    else:
-        ok_fields += 1
-
-    active_pair: tuple[int, int] | None = None
-    try:
-        active_pair = read_active_dpi_level()
-    except RuntimeError as exc:
-        warn("active DPI level", exc)
-    else:
-        if active_pair is not None:
-            ok_fields += 1
+    ok_fields = sum(field is not None for field in (hz, battery, slots, active_pair))
 
     print(f"Device: CompX mouse (PID 0x{pid:04x})")
+
+    if hz is None:
+        polling_text = "n/a"
+    elif hz is unknown_hz:
+        polling_text = f"unknown code (register 0x{PROBE_POLLING_ADDR:04X})"
+    else:
+        polling_text = f"{hz} Hz (register 0x{PROBE_POLLING_ADDR:04X})"
     print(f"Polling rate: {polling_text}")
+
     active_text = "n/a (register 0x0004 unset)"
+    active_slot = None
     if active_pair is not None:
         index = active_pair[0]
+        active_slot = _active_slot_for_index(index)
         active_text = f"index 0x{index:02X} (register 0x{ACTIVE_DPI_LEVEL_ADDR:04X})"
         if index == 0:
             active_text += " → no level marked (register 0x0004 holds 0x00)"
+        elif (
+            active_slot is not None
+            and slots is not None
+            and active_slot < len(slots)
+        ):
+            active_text += f" → slot [{active_slot}]: {_slot_value_text(slots[active_slot])}"
         else:
-            slot_index = _active_slot_for_index(index)
-            if (
-                slot_index is not None
-                and dpi_slots is not None
-                and slot_index < len(dpi_slots)
-            ):
-                active_text += (
-                    f" → slot [{slot_index}]: {_slot_value_text(dpi_slots[slot_index])}"
-                )
-            else:
-                active_text += (
-                    " → no matching DPI slot (level numbering assumed 1-based, "
-                    "ACTIVE_LEVEL_OFFSET — pending calibration)"
-                )
+            active_text += (
+                " → no matching DPI slot (level numbering assumed 1-based, "
+                "ACTIVE_LEVEL_OFFSET — pending calibration)"
+            )
     print(f"Active DPI level: {active_text}")
 
-    if dpi_slots is not None:
-        entries = [f"[{slot['index']}] {_slot_value_text(slot)}" for slot in dpi_slots]
-        if active_pair is not None:
-            slot_index = _active_slot_for_index(active_pair[0])
-            if slot_index is not None and slot_index < len(entries):
-                entries[slot_index] += " ← active"
+    if slots is not None:
+        entries = [f"[{slot['index']}] {_slot_value_text(slot)}" for slot in slots]
+        if active_slot is not None and active_slot < len(entries):
+            entries[active_slot] += " ← active"
         print("DPI slots: " + " ".join(entries))
     else:
         print("DPI slots: n/a")
 
-    print(battery_text)
+    if battery is None:
+        print("Battery: n/a")
+    else:
+        print(_battery_text(*battery))
 
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
-    return 0 if ok_fields else 1
+    if ok_fields == 0:
+        raise RuntimeError(
+            "No status field could be read from the CompX mouse — is "
+            "another program writing to it?"
+        )
+    return 0
 
 
 def cmd_battery(_args: argparse.Namespace) -> int:
