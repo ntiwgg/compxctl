@@ -162,6 +162,8 @@ PROBE_POLLING_HZ_BY_CODE: dict[int, int] = {
 PROBE_DPI_TABLE_START = 0x000C
 PROBE_DPI_TABLE_END = 0x002C  # exclusive
 PROBE_DPI_SLOT_BYTES = 4
+# An unset DPI slot row reads back as four 0xFF bytes ("empty").
+EMPTY_SLOT = (0xFF, 0xFF, 0xFF, 0xFF)
 
 # Status readouts (v1.1.0) — register addresses and battery framing
 # confirmed on hardware (a FA7B 2.4G dual-mode mouse).
@@ -226,6 +228,20 @@ def dpi_decode(code: int, mul: int = 0) -> int | None:
     if mul != 0 or not 0 <= code <= 0x7F:
         return None
     return (code + 1) * 50
+
+
+def _slot_checksum_ok(x: int, y: int, mul: int, crc: int) -> bool:
+    """True when a DPI slot row satisfies its checksum identity: the four
+    stored bytes (x, y, mul, per-slot checksum) sum to ≡ 0x55 (mod 256)."""
+    return (x + y + mul + crc) & 0xFF == 0x55
+
+
+def _active_slot_for_index(index: int) -> int | None:
+    """Map the raw active-level index (register 0x0004, 1-based) to the DPI
+    slot row it marks; None when the byte is not a 1..8 level index."""
+    if DPI_LEVEL_INDEX_MIN <= index <= DPI_LEVEL_INDEX_MAX:
+        return index - ACTIVE_LEVEL_OFFSET
+    return None
 
 
 def _build_write_frame(addr: int, data: bytes) -> bytes:
@@ -621,7 +637,8 @@ def find_device_entries() -> list[dict]:
     try:
         for product_id in PRODUCT_IDS:
             entries.extend(hid.enumerate(VENDOR_ID, product_id))
-    except Exception:
+    except Exception:  # noqa: BLE001 — deliberate catch-all: enumeration is
+        # best-effort; any hidapi failure means "no device visible now".
         return []
     return entries
 
@@ -740,7 +757,7 @@ def read_config_register(addr: int, length: int) -> bytes:
     """
     command = _build_read_frame(addr, length)
     last_detail = f"No config-memory reply from the device for 0x{addr:04X}"
-    for attempt in range(READ_ATTEMPTS):
+    for _ in range(READ_ATTEMPTS):
         try:
             _usb_send_report(command, report_type=0x03)  # feature report 0x0308
         except OSError as exc:
@@ -844,11 +861,10 @@ def read_dpi_slots() -> list[dict]:
     for offset in range(0, table_bytes, PROBE_BLOCK_BYTES):
         data = read_config_register(PROBE_DPI_TABLE_START + offset, PROBE_BLOCK_BYTES)
         for local in range(0, PROBE_BLOCK_BYTES, PROBE_DPI_SLOT_BYTES):
-            row = data[local : local + PROBE_DPI_SLOT_BYTES]
-            x, y, mul, crc = row
+            x, y, mul, crc = data[local : local + PROBE_DPI_SLOT_BYTES]
             addr = PROBE_DPI_TABLE_START + offset + local
-            crc_ok = (x + y + mul + crc) & 0xFF == 0x55
-            dpi = None if row == b"\xff" * PROBE_DPI_SLOT_BYTES else dpi_decode(x, mul)
+            crc_ok = _slot_checksum_ok(x, y, mul, crc)
+            dpi = dpi_decode(x, mul)
             slots.append(
                 {
                     "index": (addr - PROBE_DPI_TABLE_START) // PROBE_DPI_SLOT_BYTES,
@@ -877,7 +893,7 @@ def read_battery() -> tuple[int, bool, int]:
     retried: a late reply must not be doubled.
     """
     last_detail = "no battery reply"
-    for attempt in range(READ_ATTEMPTS):
+    for _ in range(READ_ATTEMPTS):
         try:
             _usb_send_report(_build_battery_request())
         except OSError as exc:
@@ -886,7 +902,7 @@ def read_battery() -> tuple[int, bool, int]:
             ) from exc
 
         try:
-            reply = _usb_read_reply(timeout=PROBE_READ_TIMEOUT_MS)
+            reply = _usb_read_reply()
         except OSError as exc:
             raise RuntimeError(f"Battery reply could not be read: {exc}") from exc
         if reply is None:
@@ -935,7 +951,9 @@ def _apply_rate_packets(
     for index, packet in enumerate(packets):
         try:
             _usb_send_report(packet)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — per-packet USB failures are
+            # collected as warnings: pyusb may raise varied exceptions across
+            # channels, and one bad packet must not abort the whole `set`.
             errors.append(f"usb: {exc}")
         else:
             delivered.add(index)
@@ -950,7 +968,8 @@ def _apply_rate_packets(
             _send_packet_to_path(path, packet)
         except (PermissionError, OSError) as exc:
             errors.append(_format_hid_error(exc))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — hidapi paths may raise other
+            # error types; each is recorded and the remaining channels still run.
             errors.append(str(exc))
         else:
             delivered.add(index)
@@ -1059,7 +1078,9 @@ def measure_event_rate_hz(event_path: str, seconds: float = MEASURE_SECONDS) -> 
                     break
                 if event.type == ecodes.EV_REL:
                     counted += 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — the reader thread is stopped
+            # by closing the device; whatever evdev raises on that shutdown path
+            # is only reported when it was NOT the deliberate stop.
             if not stop.is_set():
                 errors.append(str(exc))
 
@@ -1092,7 +1113,7 @@ def _slot_value_text(slot: dict) -> str:
     extended encoding print the raw code (with mul when it is the cause:
     "raw:0x7B(mul=0x44)"), and an unset row prints "empty".
     """
-    if (slot["x"], slot["y"], slot["mul"], slot["crc"]) == (0xFF,) * 4:
+    if (slot["x"], slot["y"], slot["mul"], slot["crc"]) == EMPTY_SLOT:
         return "empty"
     if slot["dpi"] is not None:
         return str(slot["dpi"])
@@ -1112,23 +1133,19 @@ def _battery_text(percent: int, charging: bool, state: int) -> str:
     return text
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def cmd_status(_args: argparse.Namespace) -> int:
     """`status` entry point: read-only device snapshot.
 
     Every field is read in its own short raw-USB session (claim +
     detach/re-attach, a few ms each — acceptable for a one-shot readout).
     A failing field degrades to "n/a" with a warning on stderr instead of
     failing the snapshot; only a missing device — or one from which nothing
-    could be read at all — exits non-zero.
+    could be read at all — exits non-zero (raised to main() as
+    RuntimeError, printed as "Error: ...").
     """
-    try:
-        pid = get_active_product_id()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    pid = get_active_product_id()
     if pid is None:
-        print(f"Error: {DEVICE_NOT_FOUND_TEXT}", file=sys.stderr)
-        return 1
+        raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
 
     warnings: list[str] = []
     ok_fields = 0
@@ -1183,8 +1200,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         if index == 0:
             active_text += " → no level marked (register 0x0004 holds 0x00)"
         else:
-            slot_index = index - ACTIVE_LEVEL_OFFSET
-            if dpi_slots is not None and 0 <= slot_index < len(dpi_slots):
+            slot_index = _active_slot_for_index(index)
+            if (
+                slot_index is not None
+                and dpi_slots is not None
+                and slot_index < len(dpi_slots)
+            ):
                 active_text += (
                     f" → slot [{slot_index}]: {_slot_value_text(dpi_slots[slot_index])}"
                 )
@@ -1197,9 +1218,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     if dpi_slots is not None:
         entries = [f"[{slot['index']}] {_slot_value_text(slot)}" for slot in dpi_slots]
-        if active_pair is not None and active_pair[0] != 0:
-            slot_index = active_pair[0] - ACTIVE_LEVEL_OFFSET
-            if 0 <= slot_index < len(entries):
+        if active_pair is not None:
+            slot_index = _active_slot_for_index(active_pair[0])
+            if slot_index is not None and slot_index < len(entries):
                 entries[slot_index] += " ← active"
         print("DPI slots: " + " ".join(entries))
     else:
@@ -1212,14 +1233,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0 if ok_fields else 1
 
 
-def cmd_battery(args: argparse.Namespace) -> int:
-    """`battery` entry point: read the battery level and charging state."""
-    try:
-        percent, charging, state = read_battery()
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    print(_battery_text(percent, charging, state))
+def cmd_battery(_args: argparse.Namespace) -> int:
+    """`battery` entry point: read the battery level and charging state.
+
+    Transport failures raise RuntimeError/OSError, which main() reports as
+    "Error: ..." — the battery readout has no field-level degradation.
+    """
+    print(_battery_text(*read_battery()))
     return 0
 
 
@@ -1230,9 +1250,7 @@ def _print_dpi_slots() -> int:
 
     active_slot: int | None = None
     if active_pair is not None:
-        index = active_pair[0]
-        if DPI_LEVEL_INDEX_MIN <= index <= DPI_LEVEL_INDEX_MAX:
-            active_slot = index - ACTIVE_LEVEL_OFFSET
+        active_slot = _active_slot_for_index(active_pair[0])
 
     print(
         "DPI slots (register 0x0004 = active level index; "
@@ -1289,10 +1307,10 @@ def _resolve_active_slot() -> tuple[int, bool]:
     pair = read_active_dpi_level()
     if pair is None:
         return 0, False
-    index = pair[0]
-    if DPI_LEVEL_INDEX_MIN <= index <= DPI_LEVEL_INDEX_MAX:
-        return index - ACTIVE_LEVEL_OFFSET, True
-    return 0, False
+    slot = _active_slot_for_index(pair[0])
+    if slot is None:
+        return 0, False
+    return slot, True
 
 
 def _write_dpi_slot(target_slot: int, code: int) -> None:
@@ -1388,20 +1406,17 @@ def cmd_set(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    """`check` entry point: measure the actual polling rate via input events."""
-    try:
-        event_path = find_event_device(args.device)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    """`check` entry point: measure the actual polling rate via input events.
+
+    Errors raise RuntimeError/OSError and are reported by main() as
+    "Error: ...", after any partial stdout ("Event device: …") already
+    printed above — the location of the failure is visible either way.
+    """
+    event_path = find_event_device(args.device)
 
     print(f"Event device: {event_path}")
     print(f"Move the mouse… measuring for ~{MEASURE_SECONDS:g} s", flush=True)
-    try:
-        measured = measure_event_rate_hz(event_path)
-    except RuntimeError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    measured = measure_event_rate_hz(event_path)
 
     if measured <= 0:
         print("Measured rate: ~0 Hz (no mouse movement detected during the window)")
@@ -1446,13 +1461,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
     data = bytearray()
     for offset in range(0, length, PROBE_BLOCK_BYTES):
         chunk_length = min(PROBE_BLOCK_BYTES, length - offset)
-        data.extend(read_config_register(start + offset, chunk_length))
-
-    end = start + length
-    for offset in range(0, length, PROBE_BLOCK_BYTES):
-        chunk = data[offset : offset + PROBE_BLOCK_BYTES]
+        chunk = read_config_register(start + offset, chunk_length)
+        data.extend(chunk)
         print(f"0x{start + offset:04X}: " + chunk.hex(" "))
 
+    end = start + length
     notes: list[str] = []
     if start <= PROBE_POLLING_ADDR < end:
         code = data[PROBE_POLLING_ADDR - start]
@@ -1470,10 +1483,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
             continue
         slot_number = (slot_addr - PROBE_DPI_TABLE_START) // PROBE_DPI_SLOT_BYTES
         x, y, mul, crc = data[slot_addr - start : slot_addr - start + 4]
-        if (x, y, mul, crc) == (0xFF, 0xFF, 0xFF, 0xFF):
+        if (x, y, mul, crc) == EMPTY_SLOT:
             dpi_notes.append(f"slot {slot_number}: (empty)")
             continue
-        checksum_ok = (x + y + mul + crc) & 0xFF == 0x55
+        checksum_ok = _slot_checksum_ok(x, y, mul, crc)
         dpi_notes.append(
             f"slot {slot_number}: x=0x{x:02X} y=0x{y:02X} mul=0x{mul:02X} "
             f"crc=0x{crc:02X} (checksum {'OK' if checksum_ok else 'FAIL'})"

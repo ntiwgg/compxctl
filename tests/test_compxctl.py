@@ -1,16 +1,20 @@
-"""Unit tests for compxctl.py — pure protocol helpers only, no hardware.
+"""Unit tests for compxctl.py — pure protocol helpers and a mocked USB
+transport; no hardware is ever opened.
 
 The module imports hidapi/pyusb/evdev lazily (they are needed only inside the
 device-touching commands), so importing it needs nothing but the stdlib. These
 tests therefore run in a clean environment and never open a mouse: they cover
 the checksum identity, the write/read frame builders, the read-reply parser,
 the EEPROM packet builder against the known-good captures, the DPI codec, hex
-argument parsing and the argparse command contract.
+argument parsing and the argparse command contract — and, with the raw-USB
+transport functions replaced by scripted mocks, the read_config_register /
+read_battery retry logic and the frozen `status` snapshot.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -22,8 +26,7 @@ import pytest
 # CI, but a plain `pytest` run from elsewhere needs the source on sys.path).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import compxctl  # noqa: E402
-
+import compxctl
 
 # ==========================================================================
 # Checksum identity and the known-good frames
@@ -174,15 +177,33 @@ def test_build_read_frame_allows_ceiling_length() -> None:
     assert compxctl._verify_frame(frame)
 
 
-def _read_reply(addr: int, payload: bytes) -> bytes:
-    """Build a synthetic firmware reply: 09 08 00 AH AL LN + payload + tail."""
-    body = (
-        b"\x09\x08\x00"
-        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, len(payload)))
-        + payload
-        + b"\x00" * (compxctl.PROBE_FRAME_BYTES - 7 - len(payload))
-    )
+def _make_reply(header: bytes, data: bytes = b"") -> bytes:
+    """Assemble one 17-byte CompX reply frame from `header` + `data`.
+
+    Layout: header bytes + payload bytes + 0x00 pad + checksum tail, so the
+    whole frame sums to ≡ 0x55 (mod 256) — the identity every CompX config
+    frame must satisfy. The tail is _compx_checksum over the 16 leading
+    bytes; header + data together must fit in those 16 bytes, otherwise no
+    such frame exists and the builder refuses loudly.
+    """
+    leading = len(header) + len(data)
+    if leading > compxctl.PROBE_FRAME_BYTES - 1:
+        raise ValueError(
+            f"reply header + payload must fit in {compxctl.PROBE_FRAME_BYTES - 1} "
+            f"leading bytes, got {leading}"
+        )
+    body = header + data + b"\x00" * (compxctl.PROBE_FRAME_BYTES - 1 - leading)
     return body + bytes((compxctl._compx_checksum(body),))
+
+
+def _read_reply(addr: int, payload: bytes) -> bytes:
+    """Build a synthetic firmware reply: 09 08 00 AH AL LN + payload + tail.
+
+    The config-memory read reply the firmware sends after a _build_read_frame
+    command: header (09 08 00 AH AL LN, LN = len(payload)) plus the payload.
+    """
+    header = b"\x09\x08\x00" + bytes(((addr >> 8) & 0xFF, addr & 0xFF, len(payload)))
+    return _make_reply(header, payload)
 
 
 @pytest.mark.parametrize("payload", [b"\x01\x54", b"\x13\x13\x00\x2f", b"\x01", b"\x00" * 10])
@@ -220,6 +241,32 @@ def test_parse_read_reply_rejects_invalid_length_byte(bad_ln: int) -> None:
     reply[5] = bad_ln
     with pytest.raises(ValueError):
         compxctl._parse_read_reply(bytes(reply))
+
+
+@pytest.mark.parametrize(
+    ("header", "data"),
+    [
+        (b"\x09\x08\x00\x00\x00\x02", b"\x01\x54"),  # read reply at 0x0000, len 2
+        (b"\x09\x04\x00\x00\x00", b"\x02\x64\x01"),  # battery reply
+        (b"\x09\x08\x00", b"\x00" * 10),  # maximum read payload
+    ],
+)
+def test_make_reply_builds_full_valid_frame(header: bytes, data: bytes) -> None:
+    """_make_reply frames are 17 bytes, place header/data and sum to 0x55."""
+    frame = _make_reply(header, data)
+    assert len(frame) == compxctl.PROBE_FRAME_BYTES
+    assert frame[: len(header)] == header
+    assert frame[len(header) : len(header) + len(data)] == data
+    assert frame[len(header) + len(data) : -1] == b"\x00" * (
+        compxctl.PROBE_FRAME_BYTES - 1 - len(header) - len(data)
+    )
+    assert compxctl._verify_frame(frame)
+
+
+def test_make_reply_rejects_payload_past_leading_bytes() -> None:
+    """Header + data beyond the 16 leading bytes cannot form a 17-byte frame."""
+    with pytest.raises(ValueError):
+        _make_reply(b"\x09\x08\x00\x00\x00\x02", b"\x00" * 11)
 
 
 # ==========================================================================
@@ -503,3 +550,186 @@ def test_slot_value_text_covers_empty_plain_and_extended() -> None:
     assert compxctl._slot_value_text(empty) == "empty"
     assert compxctl._slot_value_text(plain) == "1000"
     assert compxctl._slot_value_text(extended) == "raw:0x7B(mul=0x44)"
+
+
+# ==========================================================================
+# Device layer over a mocked USB transport (no hardware)
+# ==========================================================================
+
+
+def mock_usb(
+    monkeypatch: pytest.MonkeyPatch, replies: list[bytes | None]
+) -> list[bytes]:
+    """Replace the raw-USB transport with a scripted mock.
+
+    `_usb_config_device` becomes a no-op session, `_usb_send_report` records
+    every packet it receives into the returned list, and `_usb_read_reply`
+    pops one frame from `replies` per call — an entry of None stands for the
+    timeout case. Running out of frames is a loud test bug, not a silent
+    timeout, so the mock fails fast if the code under test reads too often.
+    """
+    sent: list[bytes] = []
+    queue = list(replies)
+
+    @contextlib.contextmanager
+    def _config_device():
+        yield None
+
+    def _send_report(packet: bytes, report_type: int = 0x02) -> None:
+        sent.append(packet)
+
+    def _read_reply(timeout: int = compxctl.PROBE_READ_TIMEOUT_MS) -> bytes | None:
+        if not queue:
+            raise AssertionError(
+                "mock_usb ran out of reply frames — the code under test read "
+                "more replies than the test supplied"
+            )
+        return queue.pop(0)
+
+    monkeypatch.setattr(compxctl, "_usb_config_device", _config_device)
+    monkeypatch.setattr(compxctl, "_usb_send_report", _send_report)
+    monkeypatch.setattr(compxctl, "_usb_read_reply", _read_reply)
+    return sent
+
+
+# --- read_config_register -------------------------------------------------
+
+
+def test_read_config_register_returns_payload_from_valid_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified reply (correct echo + 0x55 checksum) yields its payload.
+
+    The single send must be exactly the built read command for (addr, length).
+    """
+    sent = mock_usb(monkeypatch, [_read_reply(0x0000, b"\x01\x54")])
+    assert compxctl.read_config_register(0x0000, 2) == b"\x01\x54"
+    assert sent == [compxctl._build_read_frame(0x0000, 2)]
+
+
+def test_read_config_register_timeout_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout (None reply) raises immediately after exactly one send.
+
+    Timeouts are deliberately NOT retried: a late reply must not be doubled.
+    """
+    sent = mock_usb(monkeypatch, [None])
+    with pytest.raises(RuntimeError, match="timed out"):
+        compxctl.read_config_register(0x0000, 2)
+    assert len(sent) == 1
+
+
+def test_read_config_register_drains_stale_reply_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrong-echo frame (a stale `set` write-ack) is drained and retried."""
+    stale = _make_reply(b"\x09\x08\x00\xab\xcd\x02", b"\x00\x00")
+    sent = mock_usb(monkeypatch, [stale, _read_reply(0x0000, b"\x01\x54")])
+    assert compxctl.read_config_register(0x0000, 2) == b"\x01\x54"
+    assert len(sent) == 2
+
+
+def test_read_config_register_drains_bad_checksum_reply_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frame failing the 0x55 identity is also stale: drained and retried."""
+    corrupted = bytearray(_read_reply(0x0000, b"\x01\x54"))
+    corrupted[-1] ^= 0xFF
+    sent = mock_usb(monkeypatch, [bytes(corrupted), _read_reply(0x0000, b"\x01\x54")])
+    assert compxctl.read_config_register(0x0000, 2) == b"\x01\x54"
+    assert len(sent) == 2
+
+
+def test_read_config_register_exhausts_retries_on_stale_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only stale frames across every attempt raise RuntimeError on the retry."""
+    stale = _make_reply(b"\x09\x08\x00\xab\xcd\x02", b"\x00\x00")
+    sent = mock_usb(monkeypatch, [stale] * compxctl.READ_ATTEMPTS)
+    with pytest.raises(RuntimeError, match=r"\(retried"):
+        compxctl.read_config_register(0x0000, 2)
+    assert len(sent) == compxctl.READ_ATTEMPTS
+
+
+# --- read_battery ---------------------------------------------------------
+
+
+def test_read_battery_returns_percent_state_and_charging_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 09 04 reply maps [6]=percent, [7]=charging flag, [5]=link state."""
+    reply = _make_reply(b"\x09\x04\x00\x00\x00", b"\x02\x64\x00")
+    sent = mock_usb(monkeypatch, [reply])
+    assert compxctl.read_battery() == (100, False, 2)
+    assert sent == [compxctl._build_battery_request()]
+
+
+def test_read_battery_reports_charging_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Charging flag byte 0x01 surfaces as charging=True."""
+    reply = _make_reply(b"\x09\x04\x00\x00\x00", b"\x02\x64\x01")
+    sent = mock_usb(monkeypatch, [reply])
+    assert compxctl.read_battery() == (100, True, 2)
+    assert len(sent) == 1
+
+
+# --- cmd_status frozen snapshot -------------------------------------------
+
+
+def _dpi_slot(index: int, addr: int, x: int, y: int, mul: int, crc: int) -> dict:
+    """One DPI slot row dict, shaped exactly like read_dpi_slots() builds."""
+    row = bytes((x, y, mul, crc))
+    return {
+        "index": index,
+        "addr": addr,
+        "x": x,
+        "y": y,
+        "mul": mul,
+        "crc": crc,
+        "crc_ok": (sum(row) & 0xFF) == 0x55,
+        "dpi": None if row == b"\xff" * 4 else compxctl.dpi_decode(x, mul),
+    }
+
+
+# Frozen `status` stdout for the mocked device below. This is a deliberate
+# byte-for-byte contract: refactoring cmd_status must not change the text a
+# user sees, and this snapshot fails loudly the day it does.
+EXPECTED_STATUS_SNAPSHOT = (
+    "Device: CompX mouse (PID 0xfa7b)\n"
+    "Polling rate: 1000 Hz (register 0x0000)\n"
+    "Active DPI level: index 0x01 (register 0x0004) → slot [0]: 1000\n"
+    "DPI slots: [0] 1000 ← active [1] empty [2] 400 "
+    "[3] raw:0x7B(mul=0x44) [4] empty [5] empty [6] empty [7] empty\n"
+    "Battery: 100% (not charging) [2.4G mode]\n"
+)
+
+
+def test_cmd_status_snapshot_matches_frozen_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`status` stdout is frozen: every read_* is mocked, so only text can drift.
+
+    The mock slots deliberately cover all three renderings — plain DPI (1000,
+    400), an unset row ("empty") and the extended encoding
+    ("raw:0x7B(mul=0x44)") — plus the "← active" marker on the active row.
+    """
+    slots = [
+        _dpi_slot(0, 0x000C, 0x13, 0x13, 0x00, 0x2F),  # plain 1000, active slot
+        _dpi_slot(1, 0x0010, 0xFF, 0xFF, 0xFF, 0xFF),  # unset
+        _dpi_slot(2, 0x0014, 0x07, 0x07, 0x00, 0x47),  # plain 400
+        _dpi_slot(3, 0x0018, 0x7B, 0x7B, 0x44, 0x00),  # extended encoding
+        _dpi_slot(4, 0x001C, 0xFF, 0xFF, 0xFF, 0xFF),  # unset
+        _dpi_slot(5, 0x0020, 0xFF, 0xFF, 0xFF, 0xFF),  # unset
+        _dpi_slot(6, 0x0024, 0xFF, 0xFF, 0xFF, 0xFF),  # unset
+        _dpi_slot(7, 0x0028, 0xFF, 0xFF, 0xFF, 0xFF),  # unset
+    ]
+    monkeypatch.setattr(compxctl, "get_active_product_id", lambda: 0xFA7B)
+    monkeypatch.setattr(compxctl, "read_polling_rate_hz", lambda: 1000)
+    monkeypatch.setattr(compxctl, "read_active_dpi_level", lambda: (1, 0x54))
+    monkeypatch.setattr(compxctl, "read_dpi_slots", lambda: slots)
+    monkeypatch.setattr(compxctl, "read_battery", lambda: (100, False, 2))
+
+    assert compxctl.cmd_status(argparse.Namespace()) == 0
+    assert capsys.readouterr().out == EXPECTED_STATUS_SNAPSHOT
