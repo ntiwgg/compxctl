@@ -1,6 +1,12 @@
-# CompX / Ardor Gaming mice — VID 25a7, PIDs: fa7b (wired), fa7c (dongle), fa03, fa93.
-# TAG+="uaccess" grants access to the active logind session (no group needed);
-# GROUP/MODE stay as a fallback for setups without logind (e.g. SSH, old distros).
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", MODE="0660", GROUP="users", TAG+="uaccess"
-SUBSYSTEM=="input", ATTRS{idVendor}=="25a7", MODE="0660", GROUP="input", TAG+="uaccess"
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", MODE="0664", GROUP="users"
+# CompX / Ardor Gaming mice — USB vendor id 25a7.
+#
+# compxctl 2.x reaches the device's config interface through libusb (pyusb), so
+# only the usb device node is needed. It no longer touches hidraw or input
+# nodes, which is why the 1.x hidraw/input rules are gone.
+#
+# TAG+="uaccess" grants access to the active logind session, so no group
+# membership is required on a normal desktop. Without logind (SSH, old
+# distros), run the device commands once with sudo instead — do not add
+# GROUP="users": that group does not exist on Fedora or Arch and the rule would
+# then silently grant nothing.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uaccess"
