@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
-"""compxctl.py — control a CompX / Ardor Gaming mouse: set the polling
-rate, list or set its DPI levels (`dpi`), snapshot the device state
-(`status`), read the battery (`battery`), measure the real rate (`check`)
-and probe (read back) its config memory.
+"""compxctl — polling rate and DPI for CompX / Ardor Gaming mice on Linux.
 
-The proprietary control protocol lives below — the packet table and report
-order for `set` in POLLING_VARIANTS, the config-memory read framing for
-`probe` in the PROBE_* section, the battery request for `status`/`battery`
-in _build_battery_request() — this file is the single source of truth.
+Two mechanisms, deliberately kept apart because they are not equivalent:
 
-Architecture — two transports talk to the same config interface
-(interface 1), layered under one protocol and one set of commands:
+* **Host polling interval** — `/sys/module/usbhid/parameters/mousepoll`, read
+  back from the endpoint descriptor. One sysfs write, reversible, no device
+  traffic, no EEPROM. Reading it needs nothing but the standard library, and
+  it answers "what rate am I actually polling at" exactly — no event counting,
+  no mouse movement.
+* **Device settings** — DPI, and (only on explicit request) the interval the
+  device advertises after a re-plug. These live inside the chip, so they still
+  need the reverse-engineered vendor protocol over raw USB (pyusb).
 
-* pyusb (raw USB) — needs no kernel driver on the interface, so it is the
-  channel behind `dpi`, `status`, `battery` and `probe` (their reads are a
-  SET_REPORT command whose reply comes back on the interrupt-IN endpoint)
-  and the always-on delivery channel of every `set` rate packet.
-* hidapi / raw hidraw ioctls — `set` and the PID line of `status` require
-  hidapi to be installed: `set` enumerates its control paths through it
-  and, when the kernel binds interface 1 to usbhid (usage pages FF01-FF04),
-  uses each hidraw node as an extra delivery channel per packet. CompX mice
-  may ship with interface 1 unbound and no such node at all; then `set`
-  falls back to the pyusb-only pass, which is why `dpi`, `battery` and
-  `probe` never touch hidapi.
+That split is the whole point of this rewrite. The previous version changed the
+polling rate by writing the vendor EEPROM by default, which is the most
+dangerous and least portable way to do it: irreversible, wear-limited, and
+reverse engineered from a single unit.
+
+The vendor protocol tables below are kept from the previous version because
+they were verified on hardware; the framing is unchanged.
 """
 
 from __future__ import annotations
@@ -30,1133 +26,775 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
-import fcntl
-import glob
 import os
+import re
 import sys
-import threading
-import time
-from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 VENDOR_ID = 0x25A7
 PRODUCT_IDS = (0xFA7B, 0xFA7C, 0xFA03, 0xFA93)
 
-# hidraw nodes exposing one of these usage pages carry the control reports.
-CONFIG_USAGE_PAGES = frozenset({0xFF01, 0xFF02, 0xFF03, 0xFF04})
+SYSFS_USB_ROOT = Path("/sys/bus/usb/devices")
+MOUSEPOLL_PATH = Path("/sys/module/usbhid/parameters/mousepoll")
 
-# The third packet of every rate variant is the EEPROM persistence write.
-EEPROM_PACKET_INDEX = 2
-MIN_SENT_FOR_SUCCESS = 2
-MEASURE_SECONDS = 1.5
+# HID boot-mouse interface: bInterfaceClass 0x03, SubClass 0x01, Protocol 0x02.
+# That is the interface the host polls for motion, so its interrupt-IN interval
+# is the polling interval a user means. The config interface is 0x03/0x01/0x01.
+MOUSE_INTERFACE_CLASS = (0x03, 0x01, 0x02)
 
-# Bounded retry for the hidraw fallback: the pyusb step detaches/re-attaches the
-# kernel driver, and udev needs a moment to re-create the hidraw node.
-SEND_ATTEMPTS = 6
-SEND_RETRY_DELAY_SEC = 0.1
+# One host interval per supported rate, in milliseconds. mousepoll takes ms.
+HOST_INTERVAL_MS_BY_RATE: dict[int, int] = {1000: 1, 500: 2, 125: 8}
 
-# Linux hidraw ioctl numbers (uapi/linux/hidraw.h). The request word mirrors
-# _IOC(_IOC_READ | _IOC_WRITE, 'H', nr, size) = 0xC0000000 | (size << 16)
-# | (ord('H') << 8) | nr; size is the report length (< 2**16).
-HIDIOCSFEATURE = 0x06
-HIDIOCSOUTPUT = 0x0B
 
-# Fixed by-id names of the mouse input nodes (checked first by `check`).
-MOUSE_BY_ID_PATHS = (
-    "/dev/input/by-id/usb-Compx_2.4G_Wireless_Receiver-event-mouse",
-    "/dev/input/by-id/usb-Compx_2.4G_Dual_Mode_Mouse-event-mouse",
-)
+# ==========================================================================
+# Sysfs layer — host polling interval. Standard library only, no device access,
+# no third-party packages. Every reader takes an injectable path so tests can
+# drive a fake sysfs tree.
+# ==========================================================================
 
-HID_PERMISSION_TEXT = (
-    "No access to the HID device. Reinstall the udev rules "
-    "(99-compx-mouse.rules) and re-plug the mouse."
-)
-INPUT_PERMISSION_HINT = (
-    "No read access to {0}. Add yourself to the input group "
-    "(`sudo usermod -aG input $USER`, then re-login) or make sure the udev rules "
-    'carry TAG+="uaccess" for active logind sessions.'
-)
-DEVICE_NOT_FOUND_TEXT = (
-    "No CompX mouse found (VID 0x25A7). Check the USB connection: lsusb -d 25a7:"
-)
-EVENT_NOT_FOUND_TEXT = (
-    "No CompX mouse event node found. Connect the mouse or pass the node "
-    "explicitly: compxctl.py check --device /dev/input/eventN"
-)
 
-# Proprietary CompX protocol — every rate is a sequence of three reports sent
-# to the config interface (report ids 0x06 / 0x08, one byte = rate value):
-#   1. report 0x06 (0x06 0x11 ...): applies the rate live; byte 3 is the rate
-#      code (0x00 -> 125 Hz, 0x01 -> 500 Hz, 0x02 -> 1000 Hz);
-#   2. report 0x08 / sub-report 0x11 (0x08 0x11 ...): applies the interval;
-#      byte 6 = report interval in ms (0x08 -> 125 Hz, 0x02 -> 500 Hz,
-#      0x01 -> 1000 Hz);
-#   3. report 0x08 / sub-report 0x07 (0x08 0x07 ...): EEPROM write so the
-#      rate survives unplug / re-plug. It writes ONLY the rate pair to config
-#      memory at 0x0000 (2-byte payload: interval code + complement), never
-#      the header bytes around it, so the DPI-level count (0x0002) and the
-#      active level index (0x0004) survive. The frame is assembled by
-#      _eeprom_packet(), never hardcoded.
-# The EEPROM write stores the rate as the report-interval code of packet 2's
-# byte 6 (value in ms): 1 ms = 1000 Hz, 2 ms = 500 Hz, 8 ms = 125 Hz. The
-# complement is 0x55 minus the code; a longer write that also stored the four
-# bytes at 0x0002..0x0005 was observed to clobber the DPI-level fields, so
-# the payload must stay exactly the 2-byte pair.
-INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
 
-# CompX config-memory (EEPROM) write frame, 17 bytes — see
-# _build_write_frame() for the generic builder:
-#   [0:3]  0x08 0x07 0x00   report 0x08, write opcode 0x07, reserved
-#   [3:5]  AH AL            write address (big-endian; 0x0000 for the rate)
-#   [5]    LN               payload length (two bytes follow for the rate write;
-#                           the frame builder accepts any length 1..10)
-#   [6:8]  rate byte        interval code: 0x01 = 1000 Hz, 0x02 = 500 Hz,
-#                           0x08 = 125 Hz (same convention as packet 2, byte 6)
-#          complement       additive complement to 0x55 (0x55 - rate byte)
-#   [8:16] 0x00 pad
-#   [16]   checksum         tail byte such that the sum of all 17 bytes is
-#                          ≡ 0x55 (mod 256) — computed, never hardcoded.
 
-# Config-memory read probe: the mouse exposes interface 1 without a hidraw
-# node, so reading is a SET_REPORT command whose reply the firmware pushes
-# onto the interface's interrupt-IN endpoint (see _build_read_frame() and
-# _parse_read_reply()):
-#   command (17 bytes): 08 08 00 AH AL LN + ten 0x00 bytes + checksum
-#     report 0x08, opcode 0x08 (0x07 is the EEPROM-write opcode above);
-#     AH/AL = 16-bit register address (big-endian), LN = bytes to read;
-#     tail = _compx_checksum over the 16 leading bytes, as with writes.
-#   reply (17 bytes, interrupt-IN endpoint of interface 1):
-#     09 08 00 AH AL LN + LN payload bytes + 0x00 pad + checksum; AH/AL/LN
-#     echo the command and the whole frame must sum to 0x55 again. The
-#     firmware refuses LN > 10 (status 0x01 + zeroes), so reads stay ≤ 10.
-# Register map of the config memory (probe prints bytes and interprets only
-# what is confirmed; status/battery read the same fields as named readouts):
-#   0x0000           polling-rate code + complement (01 54 = 1000 Hz)
-#   0x0004           active DPI level index + complement at 0x0005
-#                    (observed 01..03; the index is 1-based, see
-#                    ACTIVE_LEVEL_OFFSET — pending calibration)
-#   0x000C..0x002B   DPI slots, 4 bytes each (x, y, mul, per-slot checksum);
-#                    slot checksum = 0x55 − x − y − mul (observed 13 13 00 2f);
-#                    DPI = (x + 1) × 50 for x ≤ 0x7F and mul = 0 (dpi_decode)
-#   0x0060..0x009F   button matrix, ~0x00A0 LED; past 0x00A0 the memory is
-#                    empty 0xFF.
-PROBE_BLOCK_BYTES = 8  # bytes read per probe dump line
-PROBE_MAX_READ_BYTES = 10  # firmware ceiling for one read command (LN)
-PROBE_FRAME_BYTES = 17  # fixed size of the command and reply frames
-PROBE_READ_TIMEOUT_MS = 500  # interrupt-IN reply deadline
-# Reads retry after receiving a frame that fails verification: `set` bursts
-# leave the firmware's write acks (09 07 ...) queued on the interrupt-IN
-# endpoint, and each failed read drains exactly one such stale frame, so
-# the retry usually sees the true reply. Timeouts are NOT retried (a late
-# reply must not be doubled), so a hung device still fails fast.
+def _read_int(path: Path) -> int | None:
+    """Read a plain decimal sysfs attribute (mousepoll, speed, ...)."""
+    text = _read_text(path)
+    if text is None:
+        return None
+    try:
+        return int(text, 10)
+    except ValueError:
+        return None
+
+
+def _read_hex(path: Path) -> int | None:
+    """Read a USB descriptor attribute from sysfs.
+
+    The USB core prints these as bare hex without a 0x prefix — idVendor is
+    "25a7", bInterfaceClass is "03", bEndpointAddress is "81". Parsing them as
+    decimal silently turns 0x81 into 81, so every descriptor attribute read
+    below has to go through this function.
+    """
+    text = _read_text(path)
+    if text is None:
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def parse_interval_ms(text: str) -> float | None:
+    """Parse a sysfs endpoint interval into milliseconds.
+
+    The kernel prints this attribute in human units: "1ms" on a full-speed
+    mouse, "125us" on a high-speed one. A bare number is read as milliseconds.
+    """
+    match = re.fullmatch(r"\s*(\d+)\s*(us|ms|s)?\s*", text or "")
+    if match is None:
+        return None
+    value = int(match.group(1))
+    unit = match.group(2) or "ms"
+    if unit == "us":
+        return value / 1000.0
+    if unit == "s":
+        return value * 1000.0
+    return float(value)
+
+
+def interval_ms_from_descriptor(b_interval: int, speed_mbps: float | None) -> float:
+    """Fallback interval when sysfs carries no computed `interval` attribute.
+
+    Full- and low-speed interrupt endpoints express bInterval in frames (1 ms),
+    so bInterval *is* the interval. High-speed endpoints express it as
+    2**(bInterval-1) microframes, i.e. 2**(bInterval-1)/8 ms. Prefer the
+    kernel's own `interval` attribute whenever it exists — this is only a
+    fallback, and the unit rule above is exactly the kind of detail that is
+    easy to get wrong.
+    """
+    if speed_mbps is not None and speed_mbps >= 480:
+        return (2 ** max(b_interval - 1, 0)) / 8.0
+    return float(b_interval)
+
+
+def rate_hz_from_interval_ms(interval_ms: float | None) -> int | None:
+    """Convert an interval in milliseconds to a polling rate in Hz."""
+    if not interval_ms or interval_ms <= 0:
+        return None
+    return round(1000.0 / interval_ms)
+
+
+@dataclass(frozen=True)
+class MouseEndpoint:
+    """The interrupt-IN endpoint of the mouse interface."""
+
+    name: str
+    interval_ms: float | None
+    interval_raw: str | None
+    interval_source: str  # "interval" | "bInterval" | "unknown"
+
+    @property
+    def rate_hz(self) -> int | None:
+        return rate_hz_from_interval_ms(self.interval_ms)
+
+
+@dataclass(frozen=True)
+class Mouse:
+    """A supported mouse as it appears in sysfs."""
+
+    sysfs_dir: Path
+    vendor: int
+    product: int
+    name: str
+    speed_mbps: float | None
+    interface_dir: Path | None
+    endpoint: MouseEndpoint | None
+
+    @property
+    def rate_hz(self) -> int | None:
+        return self.endpoint.rate_hz if self.endpoint else None
+
+    @property
+    def display_name(self) -> str:
+        return self.name or f"CompX mouse {self.vendor:04x}:{self.product:04x}"
+
+
+def _mouse_endpoint(interface_dir: Path, speed_mbps: float | None) -> MouseEndpoint | None:
+    """Pick the interrupt-IN endpoint of a HID interface, with its interval."""
+    candidates = []
+    for entry in sorted(interface_dir.glob("ep_*")):
+        attributes = _read_hex(entry / "bmAttributes")
+        address = _read_hex(entry / "bEndpointAddress")
+        if attributes is None or address is None:
+            continue
+        # bmAttributes bits 0-1: 0b11 = interrupt; address bit 7 = IN.
+        if attributes & 0x03 != 0x03 or not address & 0x80:
+            continue
+        candidates.append(entry)
+    if not candidates:
+        return None
+
+    endpoint_dir = candidates[0]
+    raw = _read_text(endpoint_dir / "interval")
+    interval_ms = parse_interval_ms(raw) if raw is not None else None
+    source = "interval"
+    if interval_ms is None:
+        b_interval = _read_hex(endpoint_dir / "bInterval")
+        if b_interval is not None:
+            interval_ms = interval_ms_from_descriptor(b_interval, speed_mbps)
+            source = "bInterval"
+        else:
+            source = "unknown"
+    return MouseEndpoint(
+        name=endpoint_dir.name,
+        interval_ms=interval_ms,
+        interval_raw=raw,
+        interval_source=source,
+    )
+
+
+def find_mouses(root: Path = SYSFS_USB_ROOT) -> list[Mouse]:
+    """Every supported mouse currently on the USB bus, from sysfs alone."""
+    found: list[Mouse] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return found
+
+    for device_dir in entries:
+        vendor = _read_hex(device_dir / "idVendor")
+        product = _read_hex(device_dir / "idProduct")
+        if vendor != VENDOR_ID or product not in PRODUCT_IDS:
+            continue
+
+        speed_raw = _read_text(device_dir / "speed")
+        try:
+            speed_mbps = float(speed_raw) if speed_raw else None
+        except ValueError:
+            speed_mbps = None
+
+        interface_dir = None
+        fallback_dir = None
+        for candidate in sorted(root.glob(f"{device_dir.name}:*")):
+            triple = (
+                _read_hex(candidate / "bInterfaceClass"),
+                _read_hex(candidate / "bInterfaceSubClass"),
+                _read_hex(candidate / "bInterfaceProtocol"),
+            )
+            if triple == MOUSE_INTERFACE_CLASS:
+                interface_dir = candidate
+                break
+            if fallback_dir is None and triple[0] == 0x03:
+                fallback_dir = candidate
+        if interface_dir is None:
+            interface_dir = fallback_dir
+
+        found.append(
+            Mouse(
+                sysfs_dir=device_dir,
+                vendor=vendor,
+                product=product,
+                name=_read_text(device_dir / "product") or "",
+                speed_mbps=speed_mbps,
+                interface_dir=interface_dir,
+                endpoint=_mouse_endpoint(interface_dir, speed_mbps)
+                if interface_dir is not None
+                else None,
+            )
+        )
+    return found
+
+
+def read_mousepoll(path: Path | None = None) -> int | None:
+    """The usbhid host override in milliseconds; 0 means "use the descriptor"."""
+    return _read_int(path or MOUSEPOLL_PATH)
+
+
+def write_mousepoll(interval_ms: int, path: Path | None = None) -> None:
+    """Set the host polling interval for every USB mouse on the system."""
+    target = path or MOUSEPOLL_PATH
+    try:
+        target.write_text(f"{interval_ms}\n")
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"No permission to write {target}. It is a kernel module parameter, "
+            f"so it needs root: sudo compxctl rate host "
+            f"{rate_hz_from_interval_ms(interval_ms) or interval_ms}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Cannot write {target}: {exc}") from exc
+
+
+def usbhid_is_builtin(
+    release: str | None = None, modules_root: Path = Path("/lib/modules")
+) -> bool | None:
+    """Whether usbhid is built into the kernel rather than a loadable module.
+
+    It matters: `/etc/modprobe.d/` options are read when a module is loaded,
+    so for a built-in usbhid the `options usbhid mousepoll=...` line does
+    nothing at all and the setting must go on the kernel command line instead.
+    None means "cannot tell" (no modules.builtin for this release).
+    """
+    text = _read_text(modules_root / (release or os.uname().release) / "modules.builtin")
+    if text is None:
+        return None
+    for line in text.splitlines():
+        name = line.strip().rsplit("/", 1)[-1]
+        if name.split(".")[0] == "usbhid":
+            return True
+    return False
+
+
+def _persistence_advice(interval_ms: int) -> list[str]:
+    """How to make the host override survive a reboot, per kernel build."""
+    builtin = usbhid_is_builtin()
+    if builtin is True:
+        return [
+            "  usbhid is built into this kernel, so /etc/modprobe.d is ignored.",
+            "  To keep it across reboots, add to the kernel command line:",
+            f"    usbhid.mousepoll={interval_ms}",
+        ]
+    if builtin is False:
+        return [
+            "  Not persistent; to keep it across reboots add to /etc/modprobe.d/:",
+            f"    options usbhid mousepoll={interval_ms}",
+        ]
+    return [
+        "  Not persistent; how to keep it depends on how usbhid is built:",
+        f"    options usbhid mousepoll={interval_ms}   # loadable module",
+        f"    usbhid.mousepoll={interval_ms}           # built-in kernel",
+    ]
+
+
+def effective_rate_hz(mouse: Mouse | None, mousepoll_ms: int | None) -> tuple[int | None, str]:
+    """Resolve the rate actually in force, and name where it came from.
+
+    mousepoll != 0 is an explicit host override and wins over the descriptor;
+    when it is 0 the device's advertised interval is what the host polls.
+    """
+    if mousepoll_ms:
+        return rate_hz_from_interval_ms(float(mousepoll_ms)), "usbhid.mousepoll"
+    if mouse is not None and mouse.rate_hz is not None:
+        return mouse.rate_hz, "device descriptor"
+    return None, "unknown"
+
+
+# ==========================================================================
+# Vendor protocol — pure byte-level framing, no device access. Verified on
+# hardware in the previous version; the layout and the checksum identity are
+# unchanged, and the known-good captures are kept as regression anchors.
+# ==========================================================================
+
+COMPX_FRAME_BYTES = 17
+MAX_PAYLOAD_BYTES = 10  # firmware ceiling for one read/write payload
+CONFIG_ADDR_POLLING = 0x0000
+CONFIG_ADDR_ACTIVE_DPI = 0x0004
+DPI_TABLE_START = 0x000C
+DPI_TABLE_END = 0x002C
+DPI_SLOT_BYTES = 4
+DPI_WRITE_SLOT_MAX = 5  # slots 6-7 use an undecoded extended encoding
+EMPTY_SLOT = b"\xff\xff\xff\xff"
+PROBE_BLOCK_BYTES = 8
+PROBE_MAX_DUMP_BYTES = 0x100
+CONFIG_MEMORY_BYTES = 0x10000
 READ_ATTEMPTS = 4
-PROBE_MAX_DUMP_BYTES = 0x100  # `probe --length` ceiling
-PROBE_POLLING_ADDR = 0x0000
-PROBE_POLLING_HZ_BY_CODE: dict[int, int] = {
-    0x01: 1000,
-    0x02: 500,
-    0x04: 250,
-    0x08: 125,
+READ_TIMEOUT_MS = 500
+
+# Device-side interval codes (the value stored at 0x0000 and sent as the live
+# interval byte): 1 ms -> 0x01, 2 ms -> 0x02, 8 ms -> 0x08.
+DEVICE_INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
+RATE_BY_DEVICE_INTERVAL_CODE: dict[int, int] = {0x08: 125, 0x04: 250, 0x02: 500, 0x01: 1000}
+
+RATE_BY_CODE: dict[int, int] = {0x00: 125, 0x01: 500, 0x02: 1000}
+
+# The two live packets per rate, then the EEPROM persistence packet. Bytes
+# verified against captures from a real mouse.
+LIVE_PACKETS: dict[int, tuple[bytes, ...]] = {
+    125: (
+        b"\x06\x11\x00\x00\x00\x00\x00\x00",
+        b"\x08\x11\x00\x00\x00\x06\x08" + b"\x00" * 10,
+    ),
+    500: (
+        b"\x06\x11\x00\x01\x00\x00\x00\x00",
+        b"\x08\x11\x00\x00\x00\x06\x02" + b"\x00" * 10,
+    ),
+    1000: (
+        b"\x06\x11\x00\x02\x00\x00\x00\x00",
+        b"\x08\x11\x00\x00\x00\x06\x01" + b"\x00" * 10,
+    ),
 }
-PROBE_DPI_TABLE_START = 0x000C
-PROBE_DPI_TABLE_END = 0x002C  # exclusive
-PROBE_DPI_SLOT_BYTES = 4
-# An unset DPI slot row reads back as four 0xFF bytes ("empty").
-EMPTY_SLOT = (0xFF, 0xFF, 0xFF, 0xFF)
 
-# Status readouts (v1.1.0) — register addresses and battery framing
-# confirmed on hardware (a FA7B 2.4G dual-mode mouse).
-ACTIVE_DPI_LEVEL_ADDR = 0x0004  # 1 byte level index, complement at +1
-# The level register counts DPI levels 1..8 while the slot rows below are
-# 0-based, so the active slot is (level − offset); exact firmware meaning
-# still pending calibration.
-ACTIVE_LEVEL_OFFSET = 1
-# DPI write policy: slots 0..5 store the plain encoding (x = y = code,
-# mul = 0), so they are writable; slots 6..7 of this mouse hold the
-# not-yet-understood extended encoding (see read_dpi_slots) and are listed
-# but never overwritten.
-DPI_WRITE_SLOT_MAX = 5
-DPI_LEVEL_INDEX_MIN = 1
-DPI_LEVEL_INDEX_MAX = 8
-DPI_VALUE_ERROR_TEXT = "DPI must be a multiple of 50 between 50 and 6400"
-DPI_SLOT_ERROR_TEXT = "slot must be 0..5"
-DPI_EXTENDED_SLOT_ERROR_TEXT = "cannot write extended slot"
-# Battery reply echo: the 08 04 request comes back as 09 04 ... with
-# reply[5] = link state, reply[6] = percent, reply[7] = charging flag.
-# Observed on hardware: 09 04 00 00 00 02 64 00 -> 100%, not charging.
-BATTERY_REPLY_ECHO = b"\x09\x04"
-BATTERY_STATE_LABELS: dict[int, str] = {0x02: "2.4G mode"}
-
-
-# ==========================================================================
-# Protocol primitives — pure byte-level CompX config framing. These
-# functions never touch the device: checksum, write/read frame builders,
-# the frame verifier and the read-reply parser. Every transport and the
-# self-check below consume them.
-# ==========================================================================
-
-
-def _compx_checksum(body: bytes) -> int:
-    """Checksum tail of a CompX config frame: appended to the 16 leading
-    bytes of a frame, the whole 17-byte frame sums to ≡ 0x55 (mod 256)."""
-    return (0x55 - sum(body)) & 0xFF
-
-
-def _verify_frame(frame: bytes) -> bool:
-    """True when `frame` sums to ≡ 0x55 (mod 256) — the identity every
-    CompX config frame (write, read command and read reply) must satisfy."""
-    return (sum(frame) & 0xFF) == 0x55
-
-
-def dpi_code(dpi: int) -> int | None:
-    """Encode a DPI value into the slot code the mouse stores: the stored
-    code is (dpi / 50) − 1, so 400 → 0x07 … 6400 → 0x7F. Returns None when
-    `dpi` cannot be represented (not a multiple of 50, or beyond 0x7F)."""
-    if dpi % 50 != 0:
-        return None
-    code = dpi // 50 - 1
-    if not 0 <= code <= 0x7F:
-        return None
-    return code
-
-
-def dpi_decode(code: int, mul: int = 0) -> int | None:
-    """Decode one DPI slot code: (code + 1) × 50 for code ≤ 0x7F and
-    mul = 0. Extended encoding (code > 0x7F or mul ≠ 0) is not understood
-    yet, so it decodes to None and the caller shows the raw bytes."""
-    if mul != 0 or not 0 <= code <= 0x7F:
-        return None
-    return (code + 1) * 50
-
-
-def _slot_checksum_ok(x: int, y: int, mul: int, crc: int) -> bool:
-    """True when a DPI slot row satisfies its checksum identity: the four
-    stored bytes (x, y, mul, per-slot checksum) sum to ≡ 0x55 (mod 256)."""
-    return (x + y + mul + crc) & 0xFF == 0x55
-
-
-def _active_slot_for_index(index: int) -> int | None:
-    """Map the raw active-level index (register 0x0004, 1-based) to the DPI
-    slot row it marks; None when the byte is not a 1..8 level index."""
-    if DPI_LEVEL_INDEX_MIN <= index <= DPI_LEVEL_INDEX_MAX:
-        return index - ACTIVE_LEVEL_OFFSET
-    return None
-
-
-def _build_write_frame(addr: int, data: bytes) -> bytes:
-    """Assemble the 17-byte config-memory write frame for (addr, data).
-
-    Layout: 08 07 00 AH AL LN + data + 0x00 pad + checksum tail, where
-    AH/AL is the big-endian 16-bit address and LN the payload length. The
-    `set` EEPROM packet is the canonical frame (see _eeprom_packet()).
-    """
-    if not 1 <= len(data) <= PROBE_MAX_READ_BYTES:
-        raise ValueError(
-            f"config write payload must be 1..{PROBE_MAX_READ_BYTES} bytes, "
-            f"got {len(data)}"
-        )
-    body = (
-        b"\x08\x07\x00"  # report 0x08, write opcode 0x07, reserved 0x00
-        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, len(data)))  # AH, AL, LN
-        + data
-        + b"\x00" * (PROBE_FRAME_BYTES - 7 - len(data))  # pad to 16 leading bytes
-    )
-    return body + bytes((_compx_checksum(body),))
-
-
-def _build_read_frame(addr: int, length: int) -> bytes:
-    """Assemble the 17-byte config-memory read command for (addr, length).
-
-    Layout: 08 08 00 AH AL LN + ten 0x00 pad bytes + checksum tail. The
-    firmware answers on the interrupt-IN endpoint with the reply frame
-    parsed by _parse_read_reply().
-    """
-    if not 1 <= length <= PROBE_MAX_READ_BYTES:
-        raise ValueError(
-            f"config read length must be 1..{PROBE_MAX_READ_BYTES}, got {length}"
-        )
-    body = (
-        b"\x08\x08\x00"  # report 0x08, read opcode 0x08, reserved 0x00
-        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, length))  # AH, AL, LN
-        + b"\x00" * 10  # pad to the 16 leading bytes
-    )
-    return body + bytes((_compx_checksum(body),))
-
-
-def _build_battery_request() -> bytes:
-    """Assemble the 17-byte battery-state request frame.
-
-    Layout: 08 04 + fourteen 0x00 pad bytes + checksum tail (the same
-    0x55-identity tail as every config frame). The firmware echoes 09 04
-    on the interrupt-IN endpoint; read_battery() verifies and parses that
-    reply. Delivered as an output SET_REPORT (report_type 0x02), which the
-    FA7B firmware answers — as with the 0x08 read command, it dispatches on
-    the payload, not the report type.
-    """
-    body = b"\x08\x04" + b"\x00" * (PROBE_FRAME_BYTES - 3)  # 16 leading bytes
-    return body + bytes((_compx_checksum(body),))
-
-
-def _parse_read_reply(reply: bytes) -> bytes:
-    """Extract the payload of a config-memory read reply.
-
-    A reply is 09 08 00 AH AL LN + LN payload bytes + 0x00 pad + checksum;
-    LN is byte 5, so the frame itself says how long the payload is. The
-    parser checks the frame is complete and LN is a sane payload length
-    (1..PROBE_MAX_READ_BYTES — the firmware ceiling), then returns the
-    payload slice. Callers verify the frame first (_verify_frame + header
-    echo) and only then trust the slice.
-    """
-    if len(reply) != PROBE_FRAME_BYTES:
-        raise ValueError(
-            f"config read reply must be {PROBE_FRAME_BYTES} bytes, "
-            f"got {len(reply)}"
-        )
-    length = reply[5]
-    if not 1 <= length <= PROBE_MAX_READ_BYTES:
-        raise ValueError(
-            f"config read reply length byte LN must be 1.."
-            f"{PROBE_MAX_READ_BYTES}, got {length}"
-        )
-    return reply[6 : 6 + length]
-
-
-def _eeprom_packet(rate_code: int) -> bytes:
-    """Assemble the 17-byte EEPROM persistence packet for `rate_code`.
-
-    `rate_code` is the report-interval code the write stores (see
-    INTERVAL_CODE_BY_RATE). The rate byte and its complement form the whole
-    2-byte payload of a plain config-memory write at 0x0000, so the frame is
-    delegated to _build_write_frame() and the tail can never drift out of
-    sync with the payload. Keeping the write at 2 bytes (rate pair only)
-    matters: a longer payload would overwrite the neighbouring header fields
-    at 0x0002..0x0005 (DPI-level count and active level index), which is
-    exactly the bug this length avoids.
-    """
-    data = bytes((rate_code, 0x55 - rate_code))
-    return _build_write_frame(0x0000, data)
-
-
-# Byte-identity reference for _verify_packet_generation(): the packets below
-# are the CURRENT len=2 EEPROM writes (rate pair only at 0x0000) verified on
-# hardware on 2026-09-06 — the mouse accepts them and they no longer clobber
-# the DPI-level fields at 0x0002..0x0005 (0x06 level count, 0x01 active
-# index). The builder above must reproduce them exactly.
 _KNOWN_GOOD_EEPROM_PACKETS: dict[int, bytes] = {
     125: b"\x08\x07\x00\x00\x00\x02\x08\x4d\x00\x00\x00\x00\x00\x00\x00\x00\xef",
     500: b"\x08\x07\x00\x00\x00\x02\x02\x53\x00\x00\x00\x00\x00\x00\x00\x00\xef",
     1000: b"\x08\x07\x00\x00\x00\x02\x01\x54\x00\x00\x00\x00\x00\x00\x00\x00\xef",
 }
-# Historical captures (v1.0.1..v1.1.0, len=6): the same writes shipped with a
-# constant 01 54 00 55 tail, overwriting registers 0x0002..0x0005 (DPI level
-# count and active level index) and breaking the mouse's DPI button. They are
-# kept here only for reference — the len=2 packets above replaced them:
-#   125: b"\x08\x07\x00\x00\x00\x06\x08\x4d\x01\x54\x00\x55\x00\x00\x00\x00\x41"
-#   500: b"\x08\x07\x00\x00\x00\x06\x02\x53\x01\x54\x00\x55\x00\x00\x00\x00\x41"
-#   1000: b"\x08\x07\x00\x00\x00\x06\x01\x54\x01\x54\x00\x55\x00\x00\x00\x00\x41"
 
-# Byte-identity reference for _verify_battery_request(): the 08 04 request
-# as captured from a real mouse. The builder above must reproduce it exactly.
-_KNOWN_GOOD_BATTERY_REQUEST: bytes = (
-    b"\x08\x04" + b"\x00" * 14 + b"\x49"
-)
+_KNOWN_GOOD_BATTERY_REQUEST = b"\x08\x04" + b"\x00" * 14 + b"\x49"
 
 
-def _verify_packet_generation() -> None:
-    """Assert the built EEPROM packets match the known-good captures.
-
-    Runs only when COMPX_SELFCHECK=1 (see main()); raises AssertionError on
-    any drift so a regression in packet assembly fails fast and loud.
-    """
-    for rate, known_good in _KNOWN_GOOD_EEPROM_PACKETS.items():
-        built = _eeprom_packet(INTERVAL_CODE_BY_RATE[rate])
-        if built != known_good:
-            raise AssertionError(
-                f"EEPROM packet drift for {rate} Hz: built {built.hex(' ')} "
-                f"!= known-good {known_good.hex(' ')}"
-            )
-        if (sum(built) & 0xFF) != 0x55:
-            raise AssertionError(
-                f"EEPROM packet for {rate} Hz violates the 0x55 checksum identity"
-            )
+def compx_checksum(body: bytes) -> int:
+    """Tail byte making a whole config frame sum to 0x55 (mod 256)."""
+    return (0x55 - sum(body)) & 0xFF
 
 
-def _verify_battery_request() -> None:
-    """Assert the built battery request matches the known-good capture.
+def verify_frame(frame: bytes) -> bool:
+    return (sum(frame) & 0xFF) == 0x55
 
-    Runs only when COMPX_SELFCHECK=1 (see main()); raises AssertionError on
-    any drift in the request framing.
-    """
-    built = _build_battery_request()
-    if built != _KNOWN_GOOD_BATTERY_REQUEST:
-        raise AssertionError(
-            f"Battery request drift: built {built.hex(' ')} "
-            f"!= known-good {_KNOWN_GOOD_BATTERY_REQUEST.hex(' ')}"
+
+def build_write_frame(addr: int, data: bytes) -> bytes:
+    """17-byte config-memory write: 08 07 00 AH AL LN + data + pad + checksum."""
+    if not 1 <= len(data) <= MAX_PAYLOAD_BYTES:
+        raise ValueError(f"payload must be 1..{MAX_PAYLOAD_BYTES} bytes, got {len(data)}")
+    if not 0 <= addr < CONFIG_MEMORY_BYTES:
+        raise ValueError(f"address 0x{addr:X} is outside the config memory window")
+    body = (
+        b"\x08\x07\x00"
+        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, len(data)))
+        + data
+        + b"\x00" * (COMPX_FRAME_BYTES - 7 - len(data))
+    )
+    return body + bytes((compx_checksum(body),))
+
+
+def build_read_frame(addr: int, length: int) -> bytes:
+    """17-byte config-memory read command: 08 08 00 AH AL LN + pad + checksum."""
+    if not 1 <= length <= MAX_PAYLOAD_BYTES:
+        raise ValueError(f"read length must be 1..{MAX_PAYLOAD_BYTES}, got {length}")
+    if not 0 <= addr < CONFIG_MEMORY_BYTES or addr + length > CONFIG_MEMORY_BYTES:
+        raise ValueError(
+            f"read window 0x{addr:04X}+{length} leaves the config memory "
+            f"(0x0000..0x{CONFIG_MEMORY_BYTES - 1:04X})"
         )
-    if (sum(built) & 0xFF) != 0x55:
+    body = (
+        b"\x08\x08\x00"
+        + bytes(((addr >> 8) & 0xFF, addr & 0xFF, length))
+        + b"\x00" * 10
+    )
+    return body + bytes((compx_checksum(body),))
+
+
+def build_battery_request() -> bytes:
+    body = b"\x08\x04" + b"\x00" * (COMPX_FRAME_BYTES - 3)
+    request = body + bytes((compx_checksum(body),))
+    if request != _KNOWN_GOOD_BATTERY_REQUEST:
         raise AssertionError(
-            "Battery request violates the 0x55 checksum identity"
+            f"battery request drift: built {request.hex(' ')} != known-good "
+            f"{_KNOWN_GOOD_BATTERY_REQUEST.hex(' ')}"
         )
+    return request
 
 
-# DPI-codec round-trips confirmed on hardware: the stored code is
-# (dpi / 50) − 1, so 400 → 0x07 … 6400 → 0x7F (see dpi_code/dpi_decode).
-_DPI_CODEC_ROUND_TRIPS: tuple[tuple[int, int], ...] = (
-    (400, 0x07),
-    (800, 0x0F),
-    (1600, 0x1F),
-    (2400, 0x2F),
-    (6400, 0x7F),
-)
+def parse_read_reply(reply: bytes) -> bytes:
+    """Payload slice of a read reply: 09 08 00 AH AL LN + payload + pad + tail."""
+    if len(reply) != COMPX_FRAME_BYTES:
+        raise ValueError(f"reply must be {COMPX_FRAME_BYTES} bytes, got {len(reply)}")
+    length = reply[5]
+    if not 1 <= length <= MAX_PAYLOAD_BYTES:
+        raise ValueError(f"reply length byte must be 1..{MAX_PAYLOAD_BYTES}, got {length}")
+    return reply[6 : 6 + length]
 
 
-def _verify_dpi_codec() -> None:
-    """Assert dpi_code/dpi_decode round-trip every known-good DPI pair.
+def eeprom_packet(rate: int) -> bytes:
+    """The persistence write for `rate`: exactly two bytes at 0x0000.
 
-    Runs only when COMPX_SELFCHECK=1 (see main()); raises AssertionError on
-    any drift, and also asserts the not-yet-understood encodings decode to
-    None instead of a wrong number.
+    A longer payload once overwrote 0x0002..0x0005 (DPI level count and active
+    index) and broke the mouse's DPI button. The pair is (interval code,
+    complement to 0x55) and nothing else.
     """
-    for dpi, code in _DPI_CODEC_ROUND_TRIPS:
-        if dpi_code(dpi) != code:
-            raise AssertionError(f"dpi_code({dpi}) != 0x{code:02X}")
-        if dpi_decode(code) != dpi:
-            raise AssertionError(f"dpi_decode(0x{code:02X}) != {dpi}")
-    if dpi_decode(0x80) is not None:
-        raise AssertionError("dpi_decode accepted a code above 0x7F")
-    if dpi_decode(0x7B, mul=0x44) is not None:
-        raise AssertionError("dpi_decode accepted an extended (mul ≠ 0) slot")
+    code = DEVICE_INTERVAL_CODE_BY_RATE[rate]
+    packet = build_write_frame(CONFIG_ADDR_POLLING, bytes((code, 0x55 - code)))
+    known_good = _KNOWN_GOOD_EEPROM_PACKETS[rate]
+    if packet != known_good:
+        raise AssertionError(
+            f"EEPROM packet drift for {rate} Hz: built {packet.hex(' ')} "
+            f"!= known-good {known_good.hex(' ')}"
+        )
+    return packet
 
 
-POLLING_VARIANTS: dict[int, tuple[bytes, ...]] = {
-    125: (
-        b"\x06\x11\x00\x00\x00\x00\x00\x00",
-        b"\x08\x11\x00\x00\x00\x06\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        _eeprom_packet(INTERVAL_CODE_BY_RATE[125]),
-    ),
-    500: (
-        b"\x06\x11\x00\x01\x00\x00\x00\x00",
-        b"\x08\x11\x00\x00\x00\x06\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        _eeprom_packet(INTERVAL_CODE_BY_RATE[500]),
-    ),
-    1000: (
-        b"\x06\x11\x00\x02\x00\x00\x00\x00",
-        b"\x08\x11\x00\x00\x00\x06\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-        _eeprom_packet(INTERVAL_CODE_BY_RATE[1000]),
-    ),
-}
+def dpi_code(dpi: int) -> int | None:
+    """Stored code is (dpi / 50) - 1, valid for 50..6400."""
+    if dpi % 50 != 0:
+        return None
+    code = dpi // 50 - 1
+    return code if 0 <= code <= 0x7F else None
+
+
+def dpi_decode(code: int, mul: int = 0) -> int | None:
+    """Inverse of dpi_code; None for the undecoded extended encoding."""
+    if mul != 0 or not 0 <= code <= 0x7F:
+        return None
+    return (code + 1) * 50
+
+
+def slot_checksum_ok(x: int, y: int, mul: int, crc: int) -> bool:
+    return (x + y + mul + crc) & 0xFF == 0x55
+
+
+def active_slot_for_index(index: int) -> int | None:
+    """Register 0x0004 counts levels 1..8; slot rows are 0-based."""
+    return index - 1 if 1 <= index <= 8 else None
+
+
+def dpi_slot_addr(slot: int) -> int:
+    return DPI_TABLE_START + DPI_SLOT_BYTES * slot
 
 
 # ==========================================================================
-# USB transport (pyusb) — the raw-USB channel to interface 1. Works whether
-# or not the kernel bound the interface, so it is the primary channel of
-# `probe` and `set`. Each call owns its claimed session (_usb_config_device),
-# which lets callers compose _usb_send_report and _usb_read_reply freely.
+# Raw-USB transport (pyusb) — one claimed session per command, so a command
+# pays the kernel-driver detach/re-attach once instead of once per transfer.
 # ==========================================================================
 
 
 def _pyusb():
-    """Import pyusb lazily: it is only needed by the raw-USB `set`/`probe` paths."""
     try:
         import usb.core
         import usb.util
     except ImportError as exc:
         raise RuntimeError(
-            "The `usb` package (pyusb) is missing — it is required for this "
-            "command. Install it with: pip install pyusb"
+            "The `usb` package (pyusb) is missing — it is required for the "
+            "device commands (dpi, status, battery, probe, rate device). "
+            "Install it with: pip install pyusb"
         ) from exc
     return usb.core, usb.util
 
 
-@contextlib.contextmanager
-def _usb_config_device():
-    """Yield the CompX mouse with its config interface (interface 1) claimed.
+class UsbSession:
+    """The CompX config interface (interface 1), claimed for one command."""
 
-    Detaches the kernel driver (usbhid) if it owns interface 1 and re-attaches
-    it on exit, so raw-USB traffic never leaves the interface in a broken
-    state. Shared by `set` (SET_REPORT writes) and `probe` (register reads),
-    which both talk to interface 1 through pyusb.
-    """
-    usb_core, usb_util = _pyusb()
+    def __init__(self, timeout_ms: int = READ_TIMEOUT_MS) -> None:
+        self.timeout_ms = timeout_ms
+        self._device = None
+        self._usb_core = None
+        self._usb_util = None
+        self._detached = False
 
-    usb_dev = None
-    for product_id in PRODUCT_IDS:
-        usb_dev = usb_core.find(idVendor=VENDOR_ID, idProduct=product_id)
-        if usb_dev is not None:
-            break
-    if usb_dev is None:
-        raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
+    def __enter__(self) -> "UsbSession":
+        usb_core, usb_util = _pyusb()
+        self._usb_core, self._usb_util = usb_core, usb_util
 
-    detached = False
-    try:
-        if usb_dev.is_kernel_driver_active(1):
-            usb_dev.detach_kernel_driver(1)
-            detached = True
-        usb_util.claim_interface(usb_dev, 1)
-    except usb_core.USBError as exc:
-        raise RuntimeError(
-            f"Cannot claim the CompX config interface (interface 1): {exc}"
-        ) from exc
-
-    try:
-        yield usb_dev
-    finally:
+        device = None
+        for product_id in PRODUCT_IDS:
+            device = usb_core.find(idVendor=VENDOR_ID, idProduct=product_id)
+            if device is not None:
+                break
+        if device is None:
+            raise RuntimeError(
+                "No CompX mouse found (VID 0x25A7). Check the USB connection: "
+                "lsusb -d 25a7:"
+            )
         try:
-            usb_util.release_interface(usb_dev, 1)
-        except usb_core.USBError:
-            pass  # the device vanished mid-operation — nothing left to restore
-        if detached:
-            try:
-                usb_dev.attach_kernel_driver(1)
-            except usb_core.USBError:
-                pass
-        usb_util.dispose_resources(usb_dev)
+            if device.is_kernel_driver_active(1):
+                device.detach_kernel_driver(1)
+                self._detached = True
+            usb_util.claim_interface(device, 1)
+        except usb_core.USBError as exc:
+            raise RuntimeError(
+                f"Cannot claim the CompX config interface (interface 1): {exc}. "
+                "Install the udev rules or run once with sudo."
+            ) from exc
+        self._device = device
+        return self
 
-
-def _usb_send_report(packet: bytes, report_type: int = 0x02) -> None:
-    """Deliver one report to interface 1 as a USB SET_REPORT (lazy import).
-
-    `report_type` is the wValue high byte: 0x02 (output report) for the
-    `set` rate packets, 0x03 (feature report) for the `probe` read command.
-    The firmware dispatches on the report payload, so both forms share this
-    one transport path. pyusb failures surface as OSError, the transport
-    error type every caller (read_config_register, write_config,
-    read_battery) already wraps.
-    """
-    usb_core, _ = _pyusb()
-    with _usb_config_device() as usb_dev:
-        report_id = packet[0]
+    def __exit__(self, *exc_info: object) -> None:
+        device = self._device
+        if device is None:
+            return
         try:
-            result = usb_dev.ctrl_transfer(
+            self._usb_util.release_interface(device, 1)
+        except self._usb_core.USBError:
+            pass
+        if self._detached:
+            with contextlib.suppress(self._usb_core.USBError):
+                device.attach_kernel_driver(1)
+        self._usb_util.dispose_resources(device)
+        self._device = None
+
+    # -- transfers ---------------------------------------------------------
+
+    def send(self, packet: bytes, report_type: int = 0x02) -> None:
+        """SET_REPORT to interface 1. 0x02 = output report, 0x03 = feature."""
+        assert self._device is not None
+        try:
+            sent = self._device.ctrl_transfer(
                 bmRequestType=0x21,
                 bRequest=9,  # SET_REPORT
-                wValue=(report_type << 8) | report_id,
+                wValue=(report_type << 8) | packet[0],
                 wIndex=1,
                 data_or_wLength=packet,
                 timeout=1000,
             )
-        except usb_core.USBError as exc:
+        except self._usb_core.USBError as exc:
             raise OSError(str(exc)) from exc
-        if result != len(packet):
+        if sent != len(packet):
             raise OSError("USB SET_REPORT rejected by the device")
 
-
-def _usb_read_reply(timeout: int = PROBE_READ_TIMEOUT_MS) -> bytes | None:
-    """Wait for one reply frame on the interrupt-IN endpoint of interface 1.
-
-    Finds the endpoint exactly like `probe` did historically (first
-    interrupt-IN descriptor of the interface) and reads one
-    PROBE_FRAME_BYTES frame. Returns None when the device sends no frame
-    within `timeout` ms; any other USB error propagates as OSError so the
-    caller can attach context to it.
-    """
-    usb_core, usb_util = _pyusb()
-    with _usb_config_device() as usb_dev:
-        try:
-            configuration = usb_dev.get_active_configuration()
-        except usb_core.USBError as exc:
-            raise RuntimeError(
-                f"Cannot read the active USB configuration: {exc}"
-            ) from exc
+    def _interrupt_in_endpoint(self):
+        assert self._device is not None
+        configuration = self._device.get_active_configuration()
         try:
             interface = configuration[(1, 0)]
         except KeyError as exc:
             raise RuntimeError(
-                "The active USB configuration exposes no interface 1 "
-                "(CompX config interface)"
+                "The CompX config interface (interface 1) is not in the active "
+                "USB configuration"
             ) from exc
-
-        endpoint = usb_util.find_descriptor(
+        endpoint = self._usb_util.find_descriptor(
             interface,
             custom_match=lambda ep: (
-                usb_util.endpoint_direction(ep.bEndpointAddress)
-                == usb_util.ENDPOINT_IN
-                and usb_util.endpoint_type(ep.bmAttributes)
-                == usb_util.ENDPOINT_TYPE_INTR
+                self._usb_util.endpoint_direction(ep.bEndpointAddress)
+                == self._usb_util.ENDPOINT_IN
+                and self._usb_util.endpoint_type(ep.bmAttributes)
+                == self._usb_util.ENDPOINT_TYPE_INTR
             ),
         )
         if endpoint is None:
             raise RuntimeError(
-                "No interrupt-IN endpoint on the CompX config interface — "
-                "cannot read the config-memory reply"
+                "No interrupt-IN endpoint on the CompX config interface"
             )
+        return endpoint
 
+    def read_reply(self) -> bytes | None:
+        """One frame from interrupt-IN, or None on timeout (never retried)."""
+        assert self._device is not None
+        endpoint = self._interrupt_in_endpoint()
         try:
             return bytes(
-                usb_dev.read(
-                    endpoint.bEndpointAddress,
-                    PROBE_FRAME_BYTES,
-                    timeout=timeout,
+                self._device.read(
+                    endpoint.bEndpointAddress, COMPX_FRAME_BYTES, timeout=self.timeout_ms
                 )
             )
-        except usb_core.USBError as exc:
+        except self._usb_core.USBError as exc:
             if exc.errno == errno.ETIMEDOUT:
-                return None  # no frame within `timeout` — the caller decides
+                return None
             raise OSError(str(exc)) from exc
 
+    # -- request/response --------------------------------------------------
 
-# ==========================================================================
-# hidraw transport (hidapi + raw ioctl) — the second delivery channel of
-# `set`. Works only while the kernel bound interface 1 to usbhid and gave it
-# a hidraw node with one of the CONFIG_USAGE_PAGES.
-# ==========================================================================
+    def request(
+        self,
+        packet: bytes,
+        *,
+        report_type: int = 0x02,
+        reject: Callable[[bytes], str | None],
+        parse: Callable[[bytes], object],
+        timeout_message: str,
+    ) -> object:
+        """Send `packet`, then take the matching reply off interrupt-IN.
 
-
-def _hidapi():
-    """Import hidapi lazily: it is only needed by `set`, not `check`/`--help`."""
-    try:
-        import hid
-    except ImportError as exc:
+        A frame that fails `reject` is a stale queued frame (the firmware acks
+        writes on the same endpoint) and is drained by this read, so the
+        command is retried. A timeout is not retried: a late reply must not be
+        doubled.
+        """
+        detail = timeout_message
+        for _ in range(READ_ATTEMPTS):
+            self.send(packet, report_type=report_type)
+            reply = self.read_reply()
+            if reply is None:
+                raise RuntimeError(timeout_message)
+            reason = reject(reply)
+            if reason is None:
+                return parse(reply)
+            detail = reason
         raise RuntimeError(
-            "The `hid` package (hidapi) is missing — it is required for `set`. "
-            "Install it with: pip install hidapi"
-        ) from exc
-    return hid
+            f"{detail} (retried {READ_ATTEMPTS} times after stale frames; "
+            "is another program talking to the mouse?)"
+        )
 
+    # -- config memory -----------------------------------------------------
 
-def _unique_paths(paths: list[bytes]) -> list[bytes]:
-    """Drop duplicates while preserving first-seen order."""
-    seen: set[bytes] = set()
-    unique: list[bytes] = []
-    for path in paths:
-        if path not in seen:
-            seen.add(path)
-            unique.append(path)
-    return unique
+    def read(self, addr: int, length: int) -> bytes:
+        command = build_read_frame(addr, length)
+        register = f"0x{addr:04X}"
 
+        def reject(reply: bytes) -> str | None:
+            if len(reply) != COMPX_FRAME_BYTES:
+                return f"short reply for {register}: {len(reply)} bytes"
+            if reply[3:6] != command[3:6]:
+                return (
+                    f"reply header mismatch for {register}: got "
+                    f"{reply[3:6].hex(' ')}, expected {command[3:6].hex(' ')}"
+                )
+            if not verify_frame(reply):
+                return f"reply checksum mismatch for {register}"
+            return None
 
-def find_device_entries() -> list[dict]:
-    """Enumerate every CompX product known to hidapi; [] if enumeration fails.
+        return self.request(
+            command,
+            report_type=0x03,
+            reject=reject,
+            parse=parse_read_reply,
+            timeout_message=(
+                f"No config-memory reply for {register} (interrupt-IN timed out)"
+            ),
+        )
 
-    Raises RuntimeError when the `hid` package is not installed — the error is
-    deliberate and must not be swallowed by the enumeration fallback below.
-    """
-    hid = _hidapi()
-    entries: list[dict] = []
-    try:
-        for product_id in PRODUCT_IDS:
-            entries.extend(hid.enumerate(VENDOR_ID, product_id))
-    except Exception:  # noqa: BLE001 — deliberate catch-all: enumeration is
-        # best-effort; any hidapi failure means "no device visible now".
-        return []
-    return entries
-
-
-def _hidraw_ioctl(path: bytes, packet: bytes, *, output: bool = False) -> None:
-    """Send `packet` through the raw hidraw ioctl, bypassing hidapi."""
-    size = len(packet)
-    nr = HIDIOCSOUTPUT if output else HIDIOCSFEATURE
-    # The request word mirrors _IOC(_IOC_READ | _IOC_WRITE, 'H', nr, size) from
-    # uapi/linux/hidraw.h.
-    request = 0xC0000000 | (size << 16) | (ord("H") << 8) | nr
-    with open(path, "wb+", buffering=0) as handle:
-        if fcntl.ioctl(handle, request, packet) < 0:
-            raise OSError("hidraw ioctl rejected the report")
-
-
-def _send_packet_to_device(dev, packet: bytes) -> None:
-    """Try a feature report first, then a plain output write on one hidapi handle."""
-    last_error = "hidapi refused the report"
-    for sender_name, sender in (
-        ("feature", dev.send_feature_report),
-        ("output", dev.write),
-    ):
+    def write(self, addr: int, data: bytes) -> None:
         try:
-            result = sender(packet)
-        except OSError as exc:
-            last_error = f"{sender_name}: {exc}"
-            continue
-        if isinstance(result, int) and result < 0:
-            last_error = f"{sender_name}: rejected by the device"
-            continue
-        return
-    raise OSError(last_error)
-
-
-def _send_packet_to_path(path: bytes, packet: bytes) -> None:
-    """Send one packet via hidapi, falling back to raw hidraw ioctls.
-
-    Attempts are retried briefly: after the pyusb SET_REPORT step detaches and
-    re-attaches the kernel driver, udev re-creates the hidraw node and it may
-    not be openable for a moment. Retries never duplicate a successful send.
-    """
-    hid = _hidapi()
-    errors: list[OSError] = []
-    for attempt in range(SEND_ATTEMPTS):
-        try:
-            dev = hid.device()
-            dev.open_path(path)
-            try:
-                _send_packet_to_device(dev, packet)
-                return
-            finally:
-                dev.close()
-        except OSError as exc:
-            errors.append(exc)
-
-        packet_bytes = bytes(packet)
-        for output in (False, True):
-            try:
-                _hidraw_ioctl(path, packet_bytes, output=output)
-                return
-            except OSError as exc:
-                errors.append(exc)
-
-        if attempt + 1 < SEND_ATTEMPTS:
-            time.sleep(SEND_RETRY_DELAY_SEC)
-
-    if errors:
-        raise errors[-1]
-    raise OSError("device refused the report")
-
-
-# ==========================================================================
-# Device layer — device-level operations over the two transports:
-# control-path discovery, config register reads/writes and the multi-channel
-# `set` delivery engine (raw-USB always, hidraw paths when present).
-# ==========================================================================
-
-
-def find_device_paths() -> list[bytes]:
-    """Control hidraw paths: config usage pages first, interface #1 as fallback."""
-    entries = find_device_entries()
-    control_paths = _unique_paths(
-        entry["path"]
-        for entry in entries
-        if entry.get("usage_page") in CONFIG_USAGE_PAGES and entry.get("path")
-    )
-    if control_paths:
-        return control_paths
-    return _unique_paths(
-        entry["path"]
-        for entry in entries
-        if entry.get("interface_number") == 1 and entry.get("path")
-    )
-
-
-def get_active_product_id() -> int | None:
-    """Return the first CompX product id visible on the bus, or None."""
-    hid = _hidapi()
-    for product_id in PRODUCT_IDS:
-        if hid.enumerate(VENDOR_ID, product_id):
-            return product_id
-    return None
-
-
-def _read_config_reply(
-    *,
-    send: Callable[[], None],
-    read: Callable[[], bytes | None],
-    parse: Callable[[bytes], object],
-    timeout_message: str,
-    reject_reason: Callable[[bytes], str | None],
-) -> object:
-    """Send a config command and read its reply with stale-frame drain.
-
-    A received frame that fails header-echo or checksum validation is a stale
-    frame left over by an earlier write (the mouse acks writes on the same
-    interrupt-IN endpoint); it is drained by this read and the command is
-    retried. A read timeout is NOT retried: the reply may arrive late, and a
-    second read would steal it. `send` and `read` translate transport
-    failures into RuntimeError, which is never retried. `reject_reason`
-    returns why a frame was treated as stale — its text is attached to the
-    final RuntimeError after READ_ATTEMPTS — or None when the frame is the
-    genuine reply that `parse` should turn into the return value.
-    """
-    last_detail = timeout_message
-    for _ in range(READ_ATTEMPTS):
-        send()
-        reply = read()
-        if reply is None:
-            raise RuntimeError(timeout_message)
-        reason = reject_reason(reply)
-        if reason is None:
-            return parse(reply)
-        last_detail = reason
-    raise RuntimeError(
-        f"{last_detail} (retried {READ_ATTEMPTS} times after stale frames; "
-        "is another program writing to the mouse?)"
-    )
-
-
-def read_config_register(addr: int, length: int) -> bytes:
-    """Read `length` config-memory bytes at `addr` via the raw-USB channel.
-
-    Sends the read frame as a feature SET_REPORT and picks the reply off the
-    interrupt-IN endpoint, through the shared _read_config_reply() drain
-    loop. The reply echoes AH/AL/LN and must sum to 0x55, so both are
-    verified before the payload is trusted; a frame that fails verification
-    was probably a stale write-ack queued by a recent `set` burst and is
-    drained, with the read retried (READ_ATTEMPTS times) before RuntimeError
-    is raised with the failing register attached. Timeouts and transport
-    errors are not retried.
-    """
-    command = _build_read_frame(addr, length)
-    register = f"0x{addr:04X}"
-
-    def send() -> None:
-        try:
-            _usb_send_report(command, report_type=0x03)  # feature report 0x0308
+            self.send(build_write_frame(addr, data))
         except OSError as exc:
             raise RuntimeError(
-                f"USB SET_REPORT failed while reading config memory at "
-                f"{register}: {exc}"
+                f"USB SET_REPORT failed while writing config memory at "
+                f"0x{addr:04X}: {exc}"
             ) from exc
 
-    def read() -> bytes | None:
-        try:
-            return _usb_read_reply()
-        except OSError as exc:
+    # -- named readouts ----------------------------------------------------
+
+    def stored_rate_hz(self) -> int | None:
+        return RATE_BY_DEVICE_INTERVAL_CODE.get(self.read(CONFIG_ADDR_POLLING, 1)[0])
+
+    def active_dpi_level(self) -> tuple[int, int] | None:
+        data = self.read(CONFIG_ADDR_ACTIVE_DPI, 2)
+        return None if data == b"\xff\xff" else (data[0], data[1])
+
+    def dpi_slots(self) -> list[dict]:
+        slots: list[dict] = []
+        for offset in range(DPI_TABLE_START, DPI_TABLE_END, PROBE_BLOCK_BYTES):
+            block = self.read(offset, PROBE_BLOCK_BYTES)
+            for local in range(0, PROBE_BLOCK_BYTES, DPI_SLOT_BYTES):
+                x, y, mul, crc = block[local : local + DPI_SLOT_BYTES]
+                addr = offset + local
+                slots.append(
+                    {
+                        "index": (addr - DPI_TABLE_START) // DPI_SLOT_BYTES,
+                        "addr": addr,
+                        "x": x,
+                        "y": y,
+                        "mul": mul,
+                        "crc": crc,
+                        "crc_ok": slot_checksum_ok(x, y, mul, crc),
+                        "dpi": None
+                        if bytes((x, y, mul, crc)) == EMPTY_SLOT
+                        else dpi_decode(x, mul),
+                    }
+                )
+        return slots
+
+    def battery(self) -> tuple[int, bool, int]:
+        def reject(reply: bytes) -> str | None:
+            if len(reply) != COMPX_FRAME_BYTES or reply[:2] != b"\x09\x04":
+                return "no battery reply"
+            if not verify_frame(reply):
+                return "battery reply checksum mismatch"
+            return None
+
+        percent, charging, state = self.request(
+            build_battery_request(),
+            reject=reject,
+            parse=lambda reply: (reply[6], bool(reply[7]), reply[5]),
+            timeout_message="no battery reply",
+        )
+        if not 0 <= percent <= 100:
             raise RuntimeError(
-                f"No config-memory reply from the device for {register} "
-                f"(interrupt-IN read: {exc})"
-            ) from exc
-
-    def reject_reason(reply: bytes) -> str | None:
-        if len(reply) != PROBE_FRAME_BYTES:
-            return (
-                f"Short config-memory reply for {register}: got "
-                f"{len(reply)} bytes, expected {PROBE_FRAME_BYTES}"
+                f"Battery reply carries an impossible percentage ({percent}) — "
+                "the device may be answering a different request"
             )
-        if reply[3:6] != command[3:6]:
-            return (
-                f"Config-memory reply header mismatch for {register}: "
-                f"echo AH/AL/LN = {reply[3:6].hex(' ')} "
-                f"(expected {command[3:6].hex(' ')}) — stale reply?"
-            )
-        if not _verify_frame(reply):
-            return (
-                f"Config-memory reply checksum mismatch for {register}: "
-                "frame does not sum to 0x55"
-            )
-        return None
+        return percent, charging, state
 
-    return _read_config_reply(
-        send=send,
-        read=read,
-        parse=_parse_read_reply,
-        timeout_message=(
-            f"No config-memory reply from the device for {register} "
-            "(interrupt-IN read timed out)"
-        ),
-        reject_reason=reject_reason,
-    )
-
-
-def write_config(addr: int, data: bytes) -> None:
-    """Write `data` to config memory at `addr` via the raw-USB channel.
-
-    The generic counterpart of read_config_register(): builds the write
-    frame and delivers it as an output SET_REPORT. `set` uses the same frame
-    shape for its EEPROM packet, but delivers it through the full per-packet
-    pipeline in _apply_rate_packets().
-    """
-    frame = _build_write_frame(addr, data)
-    try:
-        _usb_send_report(frame)
-    except OSError as exc:
-        raise RuntimeError(
-            f"USB SET_REPORT failed while writing config memory at "
-            f"0x{addr:04X}: {exc}"
-        ) from exc
-
-
-def read_polling_rate_hz() -> int | None:
-    """Read the polling-rate code at 0x0000 and map it to Hz.
-
-    None means the code is not in the known map (PROBE_POLLING_HZ_BY_CODE);
-    transport failures still raise RuntimeError with the failing register
-    attached, as read_config_register() does.
-    """
-    code = read_config_register(PROBE_POLLING_ADDR, 1)[0]
-    return PROBE_POLLING_HZ_BY_CODE.get(code)
-
-
-def read_active_dpi_level() -> tuple[int, int] | None:
-    """Read the active DPI level marker: (raw index, raw complement).
-
-    The index byte lives at 0x0004, its complement at 0x0005. Returns None
-    only when the pair is unset (0xFF 0xFF). No offset interpretation
-    happens here — the caller maps the index to a slot row (see
-    ACTIVE_LEVEL_OFFSET), so the raw bytes stay available for display.
-    """
-    data = read_config_register(ACTIVE_DPI_LEVEL_ADDR, 2)
-    if data == b"\xff\xff":
-        return None
-    return data[0], data[1]
-
-
-def read_dpi_slots() -> list[dict]:
-    """Read the eight DPI slot rows (4 bytes each) from 0x000C onward.
-
-    Two rows are fetched per read command (PROBE_BLOCK_BYTES = 8). Every
-    row comes back as a dict {index, addr, x, y, mul, crc_ok, dpi}, where
-    crc_ok is the slot checksum identity ((x + y + mul + crc) ≡ 0x55) and
-    dpi is dpi_decode(x, mul) — or None for empty, bad-checksum or
-    extended-encoding rows, which the caller displays as raw bytes.
-    """
-    table_bytes = PROBE_DPI_TABLE_END - PROBE_DPI_TABLE_START
-    slots: list[dict] = []
-    for offset in range(0, table_bytes, PROBE_BLOCK_BYTES):
-        data = read_config_register(PROBE_DPI_TABLE_START + offset, PROBE_BLOCK_BYTES)
-        for local in range(0, PROBE_BLOCK_BYTES, PROBE_DPI_SLOT_BYTES):
-            x, y, mul, crc = data[local : local + PROBE_DPI_SLOT_BYTES]
-            addr = PROBE_DPI_TABLE_START + offset + local
-            crc_ok = _slot_checksum_ok(x, y, mul, crc)
-            dpi = dpi_decode(x, mul)
-            slots.append(
-                {
-                    "index": (addr - PROBE_DPI_TABLE_START) // PROBE_DPI_SLOT_BYTES,
-                    "addr": addr,
-                    "x": x,
-                    "y": y,
-                    "mul": mul,
-                    "crc": crc,
-                    "crc_ok": crc_ok,
-                    "dpi": dpi,
-                }
-            )
-    return slots
-
-
-def read_battery() -> tuple[int, bool, int]:
-    """Read the battery state: returns (percent, charging, state).
-
-    Sends the 17-byte 08 04 battery request (_build_battery_request()) as
-    an output SET_REPORT and picks the 09 04 echo reply off the
-    interrupt-IN endpoint (reply[5] = link state, reply[6] = percent,
-    reply[7] = charging flag), through the shared _read_config_reply() drain
-    loop. A received frame that fails verification was probably a stale
-    write-ack queued by a recent `set` burst — it is drained by this read,
-    so the request is retried (READ_ATTEMPTS times) before RuntimeError is
-    raised. Timeouts ("no battery reply") are not retried: a late reply must
-    not be doubled.
-    """
-    def send() -> None:
-        try:
-            _usb_send_report(_build_battery_request())
-        except OSError as exc:
+    def write_dpi(self, slot: int, code: int) -> None:
+        """Write one DPI slot, then verify every byte reads back unchanged."""
+        addr = dpi_slot_addr(slot)
+        payload = bytes((code, code, 0x00, (0x55 - 2 * code) & 0xFF))
+        self.write(addr, payload)
+        back = self.read(addr, DPI_SLOT_BYTES)
+        if back != payload:
             raise RuntimeError(
-                f"USB SET_REPORT failed while requesting the battery state: {exc}"
-            ) from exc
-
-    def read() -> bytes | None:
-        try:
-            return _usb_read_reply()
-        except OSError as exc:
-            raise RuntimeError(f"Battery reply could not be read: {exc}") from exc
-
-    def reject_reason(reply: bytes) -> str | None:
-        if len(reply) != PROBE_FRAME_BYTES:
-            return "no battery reply"
-        if reply[:2] != BATTERY_REPLY_ECHO:
-            return (
-                f"Battery reply header mismatch: {reply[:2].hex(' ')} != "
-                f"{BATTERY_REPLY_ECHO.hex(' ')} — stale reply?"
+                f"Readback mismatch for slot {slot} at 0x{addr:04X}: wrote "
+                f"{payload.hex(' ')}, read {back.hex(' ')}"
             )
-        if not _verify_frame(reply):
-            return "Battery reply checksum mismatch: frame does not sum to 0x55"
-        return None
 
-    return _read_config_reply(
-        send=send,
-        read=read,
-        parse=lambda reply: (reply[6], bool(reply[7]), reply[5]),
-        timeout_message="no battery reply",
-        reject_reason=reject_reason,
-    )
-
-
-def _format_hid_error(exc: BaseException) -> str:
-    if isinstance(exc, PermissionError):
-        return HID_PERMISSION_TEXT
-    return str(exc)
-
-
-def _apply_rate_packets(
-    path: bytes | None, rate: int
-) -> tuple[set[int], bool, list[str]]:
-    """Send every packet of `rate`: raw-USB SET_REPORT always, then hidraw.
-
-    `path` is the control hidraw node used by the hidapi/ioctl pass; when it
-    is None (no hidraw node exists for interface 1) only the raw-USB pass
-    runs. Returns (delivered, eeprom_packet_written, errors); `delivered`
-    holds the indices of every distinct packet accepted by at least one
-    channel, so a packet confirmed twice (USB and hidapi) still counts once.
-    """
-    delivered: set[int] = set()
-    eeprom_written = False
-    errors: list[str] = []
-    packets = POLLING_VARIANTS[rate]
-
-    for index, packet in enumerate(packets):
-        try:
-            _usb_send_report(packet)
-        except Exception as exc:  # noqa: BLE001 — per-packet USB failures are
-            # collected as warnings: pyusb may raise varied exceptions across
-            # channels, and one bad packet must not abort the whole `set`.
-            errors.append(f"usb: {exc}")
-        else:
-            delivered.add(index)
-            if index == EEPROM_PACKET_INDEX:
-                eeprom_written = True
-
-    if path is None:
-        return delivered, eeprom_written, errors
-
-    for index, packet in enumerate(packets):
-        try:
-            _send_packet_to_path(path, packet)
-        except (PermissionError, OSError) as exc:
-            errors.append(_format_hid_error(exc))
-        except Exception as exc:  # noqa: BLE001 — hidapi paths may raise other
-            # error types; each is recorded and the remaining channels still run.
-            errors.append(str(exc))
-        else:
-            delivered.add(index)
-            if index == EEPROM_PACKET_INDEX:
-                eeprom_written = True
-
-    return delivered, eeprom_written, errors
+    def persist_rate(self, rate: int) -> bool:
+        """Write the device's stored interval to EEPROM. False if already set."""
+        code = DEVICE_INTERVAL_CODE_BY_RATE[rate]
+        current = self.read(CONFIG_ADDR_POLLING, 2)
+        if current[0] == code:
+            return False
+        payload = bytes((code, 0x55 - code))
+        # The only call in the program that writes to the mouse's EEPROM, over
+        # a reverse-engineered frame. Refuse to send anything that is not
+        # byte-identical to the capture verified on hardware: a wrong frame
+        # here is exactly what once clobbered the DPI-level fields at
+        # 0x0002..0x0005 and broke the mouse's DPI button.
+        if build_write_frame(CONFIG_ADDR_POLLING, payload) != eeprom_packet(rate):
+            raise AssertionError(
+                f"refusing to write an EEPROM frame for {rate} Hz that does not "
+                "match the verified capture"
+            )
+        self.write(CONFIG_ADDR_POLLING, payload)
+        back = self.read(CONFIG_ADDR_POLLING, 2)
+        if back[0] != code:
+            raise RuntimeError(
+                f"EEPROM readback mismatch at 0x0000: wrote 0x{code:02X}, "
+                f"read 0x{back[0]:02X}"
+            )
+        return True
 
 
-def send_polling_packet(rate: int) -> tuple[set[int], bool, list[str]]:
-    """Apply `rate` on every control path found (raw-USB fallback included).
-
-    Returns (delivered, eeprom_packet_written, errors); `delivered` is the
-    union of distinct packet indices confirmed on any channel. Success means
-    at least MIN_SENT_FOR_SUCCESS distinct packets were delivered (see
-    POLLING_VARIANTS).
-    """
-    paths = find_device_paths()
-    # No control hidraw node (interface 1 currently has no kernel driver):
-    # the raw-USB SET_REPORT pass can still deliver every packet alone, so
-    # fall back to a USB-only pass instead of failing.
-    targets: list[bytes | None] = paths if paths else [None]
-
-    delivered: set[int] = set()
-    eeprom_written = False
-    errors: list[str] = []
-    for path in targets:
-        path_delivered, written, path_errors = _apply_rate_packets(path, rate)
-        delivered |= path_delivered
-        eeprom_written = eeprom_written or written
-        errors.extend(path_errors)
-    return delivered, eeprom_written, errors
+def apply_live_rate(session: UsbSession, rate: int) -> None:
+    """Send the two live interval packets (no EEPROM write)."""
+    for packet in LIVE_PACKETS[rate]:
+        session.send(packet)
 
 
 # ==========================================================================
-# Input measurement (evdev) — `check` support: locate the mouse input node
-# and count EV_REL events on it. Unrelated to the config interface above.
+# Commands
 # ==========================================================================
 
-
-def _sysfs_usb_id(event_path: str) -> tuple[str, str]:
-    """Return (vendor, product) hex ids of the USB device behind an event node."""
-    base = Path("/sys/class/input") / Path(event_path).name / "device" / "id"
-
-    def read(name: str) -> str:
-        try:
-            return (base / name).read_text().strip().lower()
-        except OSError:
-            return ""
-
-    return read("vendor"), read("product")
+BATTERY_STATE_LABELS: dict[int, str] = {0x02: "2.4G mode"}
 
 
-def find_event_device(explicit: str | None) -> str:
-    """Locate the mouse input node: explicit path, by-id name, then sysfs scan."""
-    if explicit:
-        if os.path.exists(explicit):
-            return os.path.realpath(explicit)
-        raise RuntimeError(f"No such device node: {explicit}")
-
-    for by_id_path in MOUSE_BY_ID_PATHS:
-        if os.path.exists(by_id_path):
-            return os.path.realpath(by_id_path)
-
-    exact_matches: list[str] = []
-    vendor_matches: list[str] = []
-    known_products = {f"{product_id:04x}" for product_id in PRODUCT_IDS}
-    for event_path in sorted(glob.glob("/dev/input/event*")):
-        vendor, product = _sysfs_usb_id(event_path)
-        if vendor != f"{VENDOR_ID:04x}":
-            continue
-        if product in known_products:
-            exact_matches.append(event_path)
-        else:
-            vendor_matches.append(event_path)
-
-    for event_path in exact_matches or vendor_matches:
-        return os.path.realpath(event_path)
-    raise RuntimeError(EVENT_NOT_FOUND_TEXT)
-
-
-def measure_event_rate_hz(event_path: str, seconds: float = MEASURE_SECONDS) -> float:
-    """Count EV_REL mouse events on `event_path` for `seconds`; return Hz."""
-    try:
-        from evdev import InputDevice, ecodes
-    except ImportError as exc:
-        raise RuntimeError(
-            "The `evdev` package is missing — it is required for `check`. "
-            "Install it with: pip install evdev"
-        ) from exc
-
-    try:
-        device = InputDevice(event_path)
-    except PermissionError as exc:
-        raise RuntimeError(INPUT_PERMISSION_HINT.format(event_path)) from exc
-
-    stop = threading.Event()
-    errors: list[str] = []
-    counted = 0
-
-    def count_events() -> None:
-        nonlocal counted
-        try:
-            for event in device.read_loop():
-                if stop.is_set():
-                    break
-                if event.type == ecodes.EV_REL:
-                    counted += 1
-        except Exception as exc:  # noqa: BLE001 — the reader thread is stopped
-            # by closing the device; whatever evdev raises on that shutdown path
-            # is only reported when it was NOT the deliberate stop.
-            if not stop.is_set():
-                errors.append(str(exc))
-
-    thread = threading.Thread(target=count_events, name="evdev-counter", daemon=True)
-    thread.start()
-    time.sleep(seconds)
-    stop.set()
-    try:
-        device.close()  # unblocks read_loop
-    except OSError:
-        pass
-    thread.join(timeout=1.0)
-
-    if errors:
-        raise RuntimeError(f"Failed while reading events from {event_path}: {errors[0]}")
-    return counted / seconds
-
-
-# ==========================================================================
-# Commands — CLI entry points. The behaviour and output of `set` and `check`
-# are frozen since v1.0.0; `status`, `battery`, `probe` and `dpi` were added
-# in v1.1.0.
-# ==========================================================================
-
-
-def _slot_value_text(slot: dict) -> str:
-    """Compact human text for one DPI slot row's stored value.
-
-    Decoded rows print the DPI ("400"), rows in the not-yet-understood
-    extended encoding print the raw code (with mul when it is the cause:
-    "raw:0x7B(mul=0x44)"), and an unset row prints "empty".
-    """
-    if (slot["x"], slot["y"], slot["mul"], slot["crc"]) == EMPTY_SLOT:
+def _slot_text(slot: dict) -> str:
+    if bytes((slot["x"], slot["y"], slot["mul"], slot["crc"])) == EMPTY_SLOT:
         return "empty"
     if slot["dpi"] is not None:
         return str(slot["dpi"])
@@ -1166,377 +804,233 @@ def _slot_value_text(slot: dict) -> str:
 
 
 def _battery_text(percent: int, charging: bool, state: int) -> str:
-    """One-line battery readout: "Battery: 100% (not charging) [2.4G mode]".
-    The bracketed link label is appended only for known states (see
-    BATTERY_STATE_LABELS)."""
     text = f"Battery: {percent}% ({'charging' if charging else 'not charging'})"
     label = BATTERY_STATE_LABELS.get(state)
-    if label is not None:
-        text += f" [{label}]"
-    return text
+    return text + (f" [{label}]" if label else "")
 
 
-def _read_field(
-    warnings: list[str], label: str, reader: Callable[[], object]
-) -> object:
-    """Read one `status` field, degrading a RuntimeError into a warning.
-
-    Returns the reader's value, or None when the read raised RuntimeError:
-    that field then prints as n/a and its failure text is recorded in
-    `warnings` as "<label>: <exc>" for the trailing warning lines.
-    """
-    try:
-        return reader()
-    except RuntimeError as exc:
-        warnings.append(f"{label}: {exc}")
-        return None
+def _require_mouse() -> Mouse:
+    mouses = find_mouses()
+    if not mouses:
+        raise RuntimeError(
+            "No CompX mouse found on the USB bus (VID 0x25A7, PIDs "
+            f"{', '.join(f'0x{p:04X}' for p in PRODUCT_IDS)}). "
+            "Check the connection: lsusb -d 25a7:"
+        )
+    return mouses[0]
 
 
-def cmd_status(_args: argparse.Namespace) -> int:
-    """`status` entry point: read-only device snapshot.
+def _describe_rate(mouse: Mouse, mousepoll_ms: int | None) -> list[str]:
+    lines = [f"Device: {mouse.display_name} ({mouse.vendor:04x}:{mouse.product:04x})"]
+    if mouse.endpoint is None:
+        lines.append("Polling rate: unknown (no interrupt-IN endpoint in sysfs)")
+    else:
+        device_hz = mouse.rate_hz
+        detail = f"{mouse.endpoint.interval_raw or '?'} via {mouse.endpoint.interval_source}"
+        lines.append(
+            f"Device advertises: {device_hz} Hz ({detail}, "
+            f"{mouse.endpoint.name})"
+            if device_hz
+            else f"Device advertises: unknown ({detail}, {mouse.endpoint.name})"
+        )
+    if mousepoll_ms:
+        lines.append(
+            f"Host override: {rate_hz_from_interval_ms(float(mousepoll_ms))} Hz "
+            f"(usbhid.mousepoll = {mousepoll_ms} ms, all USB mice)"
+        )
+    else:
+        lines.append("Host override: none (usbhid.mousepoll = 0)")
+    hz, source = effective_rate_hz(mouse, mousepoll_ms)
+    lines.append(f"Effective: {hz} Hz (from {source})" if hz else "Effective: unknown")
+    return lines
 
-    Every field is read in its own short raw-USB session (claim +
-    detach/re-attach, a few ms each — acceptable for a one-shot readout).
-    A failing field degrades to "n/a" with a warning on stderr instead of
-    failing the snapshot; only a missing device — or one from which nothing
-    could be read at all — exits non-zero (raised to main() as
-    RuntimeError, printed as "Error: ...").
-    """
-    pid = get_active_product_id()
-    if pid is None:
-        raise RuntimeError(DEVICE_NOT_FOUND_TEXT)
+
+def cmd_rate(args: argparse.Namespace) -> int:
+    """Show the polling rate, or change it on the host and/or the device."""
+    mouse = _require_mouse()
+    target = getattr(args, "target", None)
+
+    if target is None:
+        for line in _describe_rate(mouse, read_mousepoll()):
+            print(line)
+        return 0
+
+    rate = args.hz
+    ms = HOST_INTERVAL_MS_BY_RATE[rate]
+    did_something = False
+
+    if target in ("host", "both"):
+        write_mousepoll(ms)
+        print(f"Host polling interval set to {ms} ms ({rate} Hz) for all USB mice.")
+        print("  Reversible: echo 0 | sudo tee /sys/module/usbhid/parameters/mousepoll")
+        for line in _persistence_advice(ms):
+            print(line)
+        did_something = True
+
+    if target in ("device", "both"):
+        if not args.persist:
+            raise RuntimeError(
+                "Refusing to write the device's EEPROM without confirmation. "
+                f"Re-run with: compxctl rate device {rate} --persist"
+            )
+        with UsbSession() as session:
+            apply_live_rate(session, rate)
+            changed = session.persist_rate(rate)
+        if changed:
+            print(f"Device EEPROM updated to {rate} Hz ({DEVICE_INTERVAL_CODE_BY_RATE[rate]:#04x}).")
+        else:
+            print(f"Device EEPROM already stored {rate} Hz — nothing written.")
+        print("  Re-plug the mouse (or replug the receiver) for the host to re-read it.")
+        did_something = True
+
+    if not did_something:  # pragma: no cover - argparse blocks this
+        raise RuntimeError("nothing to do")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Read-only snapshot: sysfs rate plus the device's own readouts."""
+    mouse = _require_mouse()
+    mousepoll_ms = read_mousepoll()
+    for line in _describe_rate(mouse, mousepoll_ms):
+        print(line)
 
     warnings: list[str] = []
-    unknown_hz = object()  # the read succeeded, but the rate code is unmapped
-    battery = _read_field(warnings, "battery", read_battery)
-    hz = _read_field(
-        warnings, "polling rate", lambda: read_polling_rate_hz() or unknown_hz
-    )
-    slots = _read_field(warnings, "DPI slots", read_dpi_slots)
-    active_pair = _read_field(warnings, "active DPI level", read_active_dpi_level)
+    with UsbSession() as session:
+        stored = _attempt(warnings, "stored rate", session.stored_rate_hz)
+        active = _attempt(warnings, "active DPI level", session.active_dpi_level)
+        slots = _attempt(warnings, "DPI slots", session.dpi_slots)
+        battery = _attempt(warnings, "battery", session.battery)
 
-    ok_fields = sum(field is not None for field in (hz, battery, slots, active_pair))
-
-    print(f"Device: CompX mouse (PID 0x{pid:04x})")
-
-    if hz is None:
-        polling_text = "n/a"
-    elif hz is unknown_hz:
-        polling_text = f"unknown code (register 0x{PROBE_POLLING_ADDR:04X})"
+    if stored is None:
+        print("Stored rate: n/a")
     else:
-        polling_text = f"{hz} Hz (register 0x{PROBE_POLLING_ADDR:04X})"
-    print(f"Polling rate: {polling_text}")
+        print(f"Stored rate: {stored} Hz (config memory 0x0000)")
 
-    active_text = "n/a (register 0x0004 unset)"
-    active_slot = None
-    if active_pair is not None:
-        index = active_pair[0]
-        active_slot = _active_slot_for_index(index)
-        active_text = f"index 0x{index:02X} (register 0x{ACTIVE_DPI_LEVEL_ADDR:04X})"
-        if index == 0:
-            active_text += " → no level marked (register 0x0004 holds 0x00)"
-        elif (
-            active_slot is not None
-            and slots is not None
-            and active_slot < len(slots)
-        ):
-            active_text += f" → slot [{active_slot}]: {_slot_value_text(slots[active_slot])}"
-        else:
-            active_text += (
-                " → no matching DPI slot (level numbering assumed 1-based, "
-                "ACTIVE_LEVEL_OFFSET — pending calibration)"
-            )
-    print(f"Active DPI level: {active_text}")
+    active_slot = active_slot_for_index(active[0]) if active else None
+    if active is None:
+        print("Active DPI level: n/a")
+    else:
+        text = f"Active DPI level: index 0x{active[0]:02X} (0x0004)"
+        if active_slot is not None and slots and active_slot < len(slots):
+            text += f" -> slot [{active_slot}]: {_slot_text(slots[active_slot])}"
+        print(text)
 
-    if slots is not None:
-        entries = [f"[{slot['index']}] {_slot_value_text(slot)}" for slot in slots]
+    if slots:
+        entries = [f"[{s['index']}] {_slot_text(s)}" for s in slots]
         if active_slot is not None and active_slot < len(entries):
-            entries[active_slot] += " ← active"
+            entries[active_slot] += " <- active"
         print("DPI slots: " + " ".join(entries))
     else:
         print("DPI slots: n/a")
 
-    if battery is None:
-        print("Battery: n/a")
-    else:
-        print(_battery_text(*battery))
-
+    print(_battery_text(*battery) if battery else "Battery: n/a")
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
-    if ok_fields == 0:
-        raise RuntimeError(
-            "No status field could be read from the CompX mouse — is "
-            "another program writing to it?"
-        )
     return 0
 
 
-def cmd_battery(_args: argparse.Namespace) -> int:
-    """`battery` entry point: read the battery level and charging state.
-
-    Transport failures raise RuntimeError/OSError, which main() reports as
-    "Error: ..." — the battery readout has no field-level degradation.
-    """
-    print(_battery_text(*read_battery()))
-    return 0
-
-
-def _print_dpi_slots() -> int:
-    """Print the DPI slot table and the active-level line (`dpi list`)."""
-    slots = read_dpi_slots()
-    active_pair = read_active_dpi_level()
-
-    active_slot: int | None = None
-    if active_pair is not None:
-        active_slot = _active_slot_for_index(active_pair[0])
-
-    print(
-        "DPI slots (register 0x0004 = active level index; "
-        "'*' marks the active slot):"
-    )
-    print(
-        "  "
-        + "slot".ljust(6)
-        + "addr".ljust(8)
-        + "x".ljust(5)
-        + "y".ljust(5)
-        + "mul".ljust(5)
-        + "crc".ljust(6)
-        + "value"
-    )
-    for slot in slots:
-        star = "*" if slot["index"] == active_slot else " "
-        print(
-            "  "
-            + f"{star}{slot['index']}".ljust(6)
-            + f"0x{slot['addr']:04X}".ljust(8)
-            + f"{slot['x']:02X}".ljust(5)
-            + f"{slot['y']:02X}".ljust(5)
-            + f"{slot['mul']:02X}".ljust(5)
-            + f"{slot['crc']:02X}".ljust(6)
-            + _slot_value_text(slot)
-        )
-
-    if active_pair is None:
-        print("Active DPI level: unknown (register 0x0004 unset, 0xFF 0xFF)")
-    elif active_slot is None:
-        index = active_pair[0]
-        print(
-            f"Active DPI level: unknown (register 0x0004 holds 0x{index:02X}, "
-            f"not a 1..{DPI_LEVEL_INDEX_MAX} index)"
-        )
-    else:
-        print(
-            f"Active DPI level: slot {active_slot} "
-            f"(index 0x{active_pair[0]:02X}) → "
-            f"{_slot_value_text(slots[active_slot])}"
-        )
-    return 0
-
-
-def _resolve_active_slot() -> tuple[int, bool]:
-    """Map register 0x0004 to the writable slot: (slot, active_known).
-
-    The level index is 1-based (ACTIVE_LEVEL_OFFSET), so 1..8 maps to slots
-    0..7. Any other byte — 0x00 (old `set` runs cleared the marker) or 0xFF
-    (unset) — means the active level is unknown: the caller falls back to
-    slot 0 and warns before writing.
-    """
-    pair = read_active_dpi_level()
-    if pair is None:
-        return 0, False
-    slot = _active_slot_for_index(pair[0])
-    if slot is None:
-        return 0, False
-    return slot, True
-
-
-def _write_dpi_slot(target_slot: int, code: int) -> None:
-    """Write `code` into both axes of `target_slot`, then read it back.
-
-    The plain slot payload is (code, code, 0x00, checksum) with the per-slot
-    checksum identity 0x55 − x − y − mul, i.e. 0x55 − 2·code. Readback
-    verification fails fast when the stored code does not echo.
-    """
-    addr = PROBE_DPI_TABLE_START + PROBE_DPI_SLOT_BYTES * target_slot
-    checksum = (0x55 - 2 * code) & 0xFF
-    write_config(addr, bytes((code, code, 0x00, checksum)))
-    readback = read_config_register(addr, PROBE_DPI_SLOT_BYTES)
-    if readback[0] != code:
-        raise RuntimeError(
-            f"Readback verification failed for slot {target_slot} at "
-            f"0x{addr:04X}: stored x=0x{readback[0]:02X}, expected 0x{code:02X}"
-        )
+def _attempt(warnings: list[str], label: str, reader: Callable[[], object]) -> object:
+    try:
+        return reader()
+    except (RuntimeError, OSError) as exc:
+        warnings.append(f"{label}: {exc}")
+        return None
 
 
 def cmd_dpi(args: argparse.Namespace) -> int:
-    """`dpi` entry point: list the slot table or write a DPI value.
-
-    Bare `dpi` and `dpi list` print the eight slot rows with the active one
-    marked; `dpi N` writes the plain encoding into the active level's slot
-    and `dpi --slot S N` into an explicit slot 0..5.
-    """
-    value = args.value
-    slot_arg = args.slot
-
-    if slot_arg is not None and value in (None, "list"):
-        raise RuntimeError("--slot requires a DPI value (`dpi --slot S N`)")
-    if value is None or value == "list":
-        return _print_dpi_slots()
-
-    code = dpi_code(value)
-    if code is None:
-        raise RuntimeError(DPI_VALUE_ERROR_TEXT)
-
-    active_known = False
-    if slot_arg is not None:
-        if not 0 <= slot_arg <= DPI_WRITE_SLOT_MAX:
-            raise RuntimeError(DPI_SLOT_ERROR_TEXT)
-        target_slot = slot_arg
-    else:
-        target_slot, active_known = _resolve_active_slot()
-        if active_known and target_slot > DPI_WRITE_SLOT_MAX:
-            raise RuntimeError(DPI_EXTENDED_SLOT_ERROR_TEXT)
-
-    if slot_arg is None and not active_known:
-        print(
-            "warning: active DPI level unknown (register 0x0004 not a "
-            f"1..{DPI_LEVEL_INDEX_MAX} index) — writing slot {target_slot}",
-            file=sys.stderr,
-        )
-
-    slots = read_dpi_slots()
-    old_text = _slot_value_text(slots[target_slot])
-
-    _write_dpi_slot(target_slot, code)
-    subject = "active level" if active_known else f"slot {target_slot}"
-    print(f"DPI set: {subject} → {value} (was {old_text})")
-    print(f"slot {target_slot} updated, verified")
-    return 0
-
-
-def cmd_set(args: argparse.Namespace) -> int:
-    """`set` entry point: apply a polling rate and report the outcome."""
-    rate = args.rate
-    delivered, eeprom_written, errors = send_polling_packet(rate)
-    if len(delivered) >= MIN_SENT_FOR_SUCCESS:
-        pid = get_active_product_id()
-        pid_text = hex(pid) if pid is not None else "unknown"
-        total = len(POLLING_VARIANTS[rate])
-        print(f"Rate: {rate} Hz")
-        print(f"PID: {pid_text}")
-        print(
-            f"Packets delivered: {len(delivered)}/{total} distinct "
-            f"(minimum for success: {MIN_SENT_FOR_SUCCESS})"
-        )
-        if eeprom_written:
-            print("EEPROM write: done")
+    value, slot_arg = args.value, args.slot
+    with UsbSession() as session:
+        if value is None or value == "list":
+            return _print_dpi_table(session)
+        code = dpi_code(value)
+        if code is None:
+            raise RuntimeError("DPI must be a multiple of 50 between 50 and 6400")
+        if slot_arg is not None:
+            if not 0 <= slot_arg <= DPI_WRITE_SLOT_MAX:
+                raise RuntimeError(f"slot must be 0..{DPI_WRITE_SLOT_MAX}")
+            slot = slot_arg
         else:
-            print("EEPROM write: not confirmed (rate may reset after re-plug)")
-        for err in errors:
-            print(f"warning: {err}", file=sys.stderr)
-        return 0
-
-    print("Error: the device rejected the polling-rate packets", file=sys.stderr)
-    for err in errors:
-        print(f"  {err}", file=sys.stderr)
-    return 1
-
-
-def cmd_check(args: argparse.Namespace) -> int:
-    """`check` entry point: measure the actual polling rate via input events.
-
-    Errors raise RuntimeError/OSError and are reported by main() as
-    "Error: ...", after any partial stdout ("Event device: …") already
-    printed above — the location of the failure is visible either way.
-    """
-    event_path = find_event_device(args.device)
-
-    print(f"Event device: {event_path}")
-    print(f"Move the mouse… measuring for ~{MEASURE_SECONDS:g} s", flush=True)
-    measured = measure_event_rate_hz(event_path)
-
-    if measured <= 0:
-        print("Measured rate: ~0 Hz (no mouse movement detected during the window)")
-        print("Hint: keep moving the mouse while `check` runs.")
-        return 0
-    print(f"Measured rate: ~{measured:.0f} Hz")
+            active = session.active_dpi_level()
+            slot = active_slot_for_index(active[0]) if active else None
+            if slot is None:
+                raise RuntimeError(
+                    "The active DPI level in register 0x0004 is not a valid "
+                    "1..8 index, so there is no slot to write. Pass --slot S "
+                    "to name the slot explicitly."
+                )
+            if slot > DPI_WRITE_SLOT_MAX:
+                raise RuntimeError(
+                    f"slot {slot} holds an undecoded extended encoding; "
+                    "refusing to overwrite it"
+                )
+        before = _slot_text(session.dpi_slots()[slot])
+        session.write_dpi(slot, code)
+    print(f"DPI set: slot {slot} -> {value} (was {before})")
     return 0
 
 
-def _parse_hex_arg(text: str) -> int:
-    """Parse a hex CLI value like 0x000C (bare digits are hex too: `0C`)."""
-    try:
-        return int(text, 16)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"invalid hex value {text!r} (use e.g. 0x000C)"
-        ) from None
+def _print_dpi_table(session: UsbSession) -> int:
+    slots = session.dpi_slots()
+    active = session.active_dpi_level()
+    active_slot = active_slot_for_index(active[0]) if active else None
+    print("  slot  addr    x    y    mul  crc   value")
+    for slot in slots:
+        star = "*" if slot["index"] == active_slot else " "
+        print(
+            f"  {star}{slot['index']}   0x{slot['addr']:04X}  "
+            f"{slot['x']:02X}   {slot['y']:02X}   {slot['mul']:02X}   "
+            f"{slot['crc']:02X}    {_slot_text(slot)}"
+        )
+    if active is None:
+        print("Active DPI level: unknown (0x0004 unset)")
+    elif active_slot is None:
+        print(f"Active DPI level: unknown (0x0004 holds 0x{active[0]:02X})")
+    else:
+        print(f"Active DPI level: slot {active_slot} (index 0x{active[0]:02X})")
+    return 0
 
 
-def _parse_dpi_value(text: str) -> int | str:
-    """Parse the `dpi` positional value: the literal 'list' or an integer."""
-    if text == "list":
-        return "list"
-    try:
-        return int(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"invalid DPI value {text!r} (use 'list' or a multiple of 50 "
-            "between 50 and 6400)"
-        ) from None
+def cmd_battery(args: argparse.Namespace) -> int:
+    with UsbSession() as session:
+        print(_battery_text(*session.battery()))
+    return 0
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    """`probe` entry point: read and interpret a config-memory window."""
     start, length = args.start, args.length
-    if length < 1 or length > PROBE_MAX_DUMP_BYTES:
+    if start < 0 or start + length > CONFIG_MEMORY_BYTES:
         raise RuntimeError(
-            f"--length must be at least 1 byte and at most "
-            f"0x{PROBE_MAX_DUMP_BYTES:X} bytes"
+            f"window 0x{start:04X}+{length} leaves the config memory "
+            f"(0x0000..0x{CONFIG_MEMORY_BYTES - 1:04X})"
         )
-
     data = bytearray()
-    for offset in range(0, length, PROBE_BLOCK_BYTES):
-        chunk_length = min(PROBE_BLOCK_BYTES, length - offset)
-        chunk = read_config_register(start + offset, chunk_length)
-        data.extend(chunk)
-        print(f"0x{start + offset:04X}: " + chunk.hex(" "))
+    with UsbSession() as session:
+        for offset in range(0, length, PROBE_BLOCK_BYTES):
+            chunk_length = min(PROBE_BLOCK_BYTES, length - offset)
+            chunk = session.read(start + offset, chunk_length)
+            data.extend(chunk)
+            print(f"0x{start + offset:04X}: " + chunk.hex(" "))
 
-    end = start + length
     notes: list[str] = []
-    if start <= PROBE_POLLING_ADDR < end:
-        code = data[PROBE_POLLING_ADDR - start]
-        hz = PROBE_POLLING_HZ_BY_CODE.get(code)
-        if hz is None:
-            notes.append(f"polling rate code at 0x0000: 0x{code:02X} (no known Hz mapping)")
-        else:
-            notes.append(f"polling rate code at 0x0000: 0x{code:02X} = {hz} Hz")
-
-    dpi_notes: list[str] = []
-    for slot_addr in range(
-        PROBE_DPI_TABLE_START, PROBE_DPI_TABLE_END, PROBE_DPI_SLOT_BYTES
-    ):
-        if not (start <= slot_addr and slot_addr + PROBE_DPI_SLOT_BYTES <= end):
-            continue
-        slot_number = (slot_addr - PROBE_DPI_TABLE_START) // PROBE_DPI_SLOT_BYTES
-        x, y, mul, crc = data[slot_addr - start : slot_addr - start + 4]
-        if (x, y, mul, crc) == EMPTY_SLOT:
-            dpi_notes.append(f"slot {slot_number}: (empty)")
-            continue
-        checksum_ok = _slot_checksum_ok(x, y, mul, crc)
-        dpi_notes.append(
-            f"slot {slot_number}: x=0x{x:02X} y=0x{y:02X} mul=0x{mul:02X} "
-            f"crc=0x{crc:02X} (checksum {'OK' if checksum_ok else 'FAIL'})"
-        )
-    if dpi_notes:
+    if start <= CONFIG_ADDR_POLLING < start + length:
+        code = data[CONFIG_ADDR_POLLING - start]
+        hz = RATE_BY_DEVICE_INTERVAL_CODE.get(code)
         notes.append(
-            "DPI table 0x000C-0x002B: x/y/mul/crc per slot — rows with "
-            "x <= 0x7F and mul = 0 decode via dpi_decode (400..6400); "
-            "extended rows (code > 0x7F or mul != 0) are shown raw"
+            f"0x0000 stores the interval code 0x{code:02X}"
+            + (f" = {hz} Hz" if hz else " (no known rate)")
         )
-        notes.extend(dpi_notes)
-
+    for slot in range((DPI_TABLE_END - DPI_TABLE_START) // DPI_SLOT_BYTES):
+        addr = dpi_slot_addr(slot)
+        if not (start <= addr and addr + DPI_SLOT_BYTES <= start + length):
+            continue
+        x, y, mul, crc = data[addr - start : addr - start + DPI_SLOT_BYTES]
+        state = (
+            "empty"
+            if bytes((x, y, mul, crc)) == EMPTY_SLOT
+            else f"checksum {'OK' if slot_checksum_ok(x, y, mul, crc) else 'FAIL'}"
+        )
+        notes.append(f"slot {slot}: {x:02X} {y:02X} {mul:02X} {crc:02X} ({state})")
     if notes:
         print("Interpretation:")
         for note in notes:
@@ -1544,127 +1038,92 @@ def cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==========================================================================
+# CLI
+# ==========================================================================
+
+
+def _parse_int(text: str) -> int:
+    try:
+        return int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}") from None
+
+
+def _parse_dpi_value(text: str) -> int | str:
+    if text == "list":
+        return "list"
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid DPI value {text!r} (use 'list' or a multiple of 50 in 50..6400)"
+        ) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="compxctl",
-        description="Set polling rate and DPI, measure and read battery of "
-                    "CompX / Ardor Gaming mice (VID 0x25A7).",
+        description=(
+            "Polling rate and DPI for CompX / Ardor Gaming mice (VID 0x25A7). "
+            "The polling rate comes from sysfs and needs no device write; DPI "
+            "uses the vendor protocol and needs pyusb."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-
-    # No required subcommand: a bare `compxctl` runs `status` (see main()).
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    status_parser = subparsers.add_parser(
-        "status",
-        help="print a read-only device snapshot (rate, DPI levels, battery)",
-        description="Print a read-only snapshot of the CompX mouse: product id, "
-                    "polling rate, active DPI level, the eight DPI slot rows and "
-                    "the battery state (raw USB, requires pyusb).",
-    )
-    status_parser.set_defaults(func=cmd_status)
-
-    battery_parser = subparsers.add_parser(
-        "battery",
-        help="read the battery level and charging state",
-        description="Read the battery state of the CompX mouse over raw USB "
-                    "(requires pyusb). Read-only: prints percent, charging flag "
-                    "and, when known, the link mode.",
-    )
-    battery_parser.set_defaults(func=cmd_battery)
-
-    set_parser = subparsers.add_parser(
-        "set",
-        help="apply a polling rate (125, 500 or 1000 Hz)",
-        description="Apply a polling rate to the CompX mouse and print the result "
-                    "(rate, PID, distinct packets delivered, EEPROM write status).",
-    )
-    set_parser.add_argument(
+    rate = subparsers.add_parser(
         "rate",
-        type=int,
-        choices=sorted(POLLING_VARIANTS),
-        help="target polling rate in Hz",
+        help="show the polling rate, or change it (host and/or device)",
+        description=(
+            "With no arguments, print the rate the device advertises, the host "
+            "override and the effective rate. `rate host HZ` writes "
+            "usbhid.mousepoll (global, reversible, root). `rate device HZ "
+            "--persist` rewrites the device's stored interval through the "
+            "vendor protocol (per-device, persistent, EEPROM wear)."
+        ),
     )
-    set_parser.set_defaults(func=cmd_set)
+    rate.add_argument(
+        "target", nargs="?", choices=("host", "device", "both"), default=None,
+        help="where to apply the rate; omit to just print the current state",
+    )
+    rate.add_argument("hz", nargs="?", type=int, choices=sorted(HOST_INTERVAL_MS_BY_RATE))
+    rate.add_argument(
+        "--persist", action="store_true",
+        help="confirm the EEPROM write required by `rate device`",
+    )
+    rate.set_defaults(func=cmd_rate)
 
-    dpi_parser = subparsers.add_parser(
-        "dpi",
-        help="list DPI slots or set the active/selected level's DPI",
-        description="List the eight DPI slot rows and the active level, or "
-                    "write a DPI value into the active slot (default) or a "
-                    "chosen slot (--slot). Bare `dpi` equals `dpi list`. "
-                    "Requires pyusb.",
-    )
-    dpi_parser.add_argument(
-        "value",
-        metavar="VALUE",
-        type=_parse_dpi_value,
-        nargs="?",
-        default=None,
-        help="'list' or a target DPI multiple of 50 in 50..6400 "
-             "(bare `dpi` lists)",
-    )
-    dpi_parser.add_argument(
-        "--slot",
-        metavar="S",
-        type=int,
-        default=None,
-        help="write slot S (0..5) instead of the active slot",
-    )
-    dpi_parser.set_defaults(func=cmd_dpi)
+    status = subparsers.add_parser("status", help="read-only device snapshot")
+    status.set_defaults(func=cmd_status)
 
-    check_parser = subparsers.add_parser(
-        "check",
-        help="measure the actual polling rate of the mouse",
-        description="Measure the real polling rate by counting input events "
-                    "(requires the evdev package).",
-    )
-    check_parser.add_argument(
-        "--device",
-        metavar="PATH",
-        default=None,
-        help="input event node to measure (default: auto-detect)",
-    )
-    check_parser.set_defaults(func=cmd_check)
+    dpi = subparsers.add_parser("dpi", help="list DPI slots or write one")
+    dpi.add_argument("value", nargs="?", type=_parse_dpi_value, default=None,
+                     help="'list' or a DPI multiple of 50 in 50..6400")
+    dpi.add_argument("--slot", type=int, default=None, help="write slot S (0..5)")
+    dpi.set_defaults(func=cmd_dpi)
 
-    probe_parser = subparsers.add_parser(
-        "probe",
-        help="read the mouse config memory (raw USB, read-only)",
-        description="Read and interpret a window of the CompX config memory "
-                    "over raw USB (requires pyusb). Read-only: the mouse keeps "
-                    "its current settings.",
-    )
-    probe_parser.add_argument(
-        "--start",
-        metavar="ADDR",
-        type=_parse_hex_arg,
-        default=0x0000,
-        help="first config-memory address (hex, default: 0x0000)",
-    )
-    probe_parser.add_argument(
-        "--length",
-        metavar="LEN",
-        type=_parse_hex_arg,
-        default=0x40,
-        help="number of bytes to read (hex, max 0x100, default: 0x40)",
-    )
-    probe_parser.set_defaults(func=cmd_probe)
+    battery = subparsers.add_parser("battery", help="read battery level and state")
+    battery.set_defaults(func=cmd_battery)
+
+    probe = subparsers.add_parser("probe", help="read config memory (read-only)")
+    probe.add_argument("--start", type=_parse_int, default=0x0000)
+    probe.add_argument("--length", type=_parse_int, default=0x40)
+    probe.set_defaults(func=cmd_probe)
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    if os.environ.get("COMPX_SELFCHECK") == "1":
-        _verify_packet_generation()
-        _verify_battery_request()
-        _verify_dpi_codec()
     parser = build_parser()
     args = parser.parse_args(argv)
-    # A bare `compxctl` (no subcommand) means `status`.
-    func = args.func if getattr(args, "func", None) else cmd_status
+    if getattr(args, "target", None) is not None and getattr(args, "hz", None) is None:
+        parser.error("a rate target needs a rate: rate host|device|both 125|500|1000")
+    func = getattr(args, "func", None) or cmd_rate
     try:
         return func(args)
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

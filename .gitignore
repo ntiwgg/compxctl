@@ -1,9 +1,11 @@
+# Python
 __pycache__/
 *.py[cod]
-.idea/
-.cursor/
-.omo/
+.venv/
+venv/
 *.egg-info/
-.DS_Store
 build/
 dist/
+
+# Tooling
+.pytest_cache/

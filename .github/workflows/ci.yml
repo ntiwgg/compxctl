@@ -11,22 +11,36 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install pytest
-        run: pip install pytest
+      - name: Tests (no hardware, no pyusb, no root)
+        run: |
+          pip install pytest
+          pytest -v
 
-      - name: Install package
-        run: pip install .
+      - name: Packaging installs the console script
+        run: |
+          pip install .
+          compxctl --version
 
-      - name: Run tests
-        run: pytest -v
-
-      - name: Self-check (no hardware)
-        run: COMPX_SELFCHECK=1 python3 compxctl.py --version
+      - name: `rate` must work with the standard library alone
+        run: |
+          # The whole point of the rewrite: reading the polling rate needs no
+          # third-party package. If pyusb were installed, this check would pass
+          # for the wrong reason, so fail loudly instead.
+          if python -c "import usb" 2>/dev/null; then
+            echo "::error::pyusb is installed; this check would not prove isolation"
+            exit 1
+          fi
+          python compxctl.py --version
+          python compxctl.py rate
+          status=$?
+          # 0 = a mouse was found; 1 = no CompX mouse on this runner (expected).
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+            echo "::error::unexpected exit status $status"
+            exit 1
+          fi
