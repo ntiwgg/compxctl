@@ -28,6 +28,11 @@ die() {
     exit 1
 }
 
+# Note: the udev file carries two rules. The hidraw one is what every command
+# needs; the usb_device one is only for `rate device --persist --reset-port`,
+# which re-enumerates the receiver. Both are installed — removing the second line
+# from /etc/udev/rules.d/99-compx-mouse.rules is enough if you never use it.
+
 # Run a command with root privileges: direct when already root, sudo otherwise.
 run_as_root() {
     if [[ $EUID -eq 0 ]]; then

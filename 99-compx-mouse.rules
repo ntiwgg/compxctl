@@ -6,10 +6,12 @@
 #    EEPROM write behind `rate device --persist`). The config interface is a HID
 #    interface that usbhid already owns, and hidraw is how user space reaches it
 #    without detaching the kernel driver.
-#  * usb_device — the port reset that follows `rate device --persist`
-#    (USBDEVFS_RESET on /dev/bus/usb/BBB/DDD), so the receiver re-enumerates
-#    instead of asking you to crawl under the desk. Without it the reset is
-#    skipped with a warning and the command still does its job.
+#  * usb_device — optional, and needed only by `rate device --persist
+#    --reset-port`: a port reset (USBDEVFS_RESET on /dev/bus/usb/BBB/DDD) that
+#    makes the receiver re-enumerate. Nothing else uses it, because the endpoint
+#    descriptor does not change with the stored interval, so the re-enumeration
+#    costs a second off the bus and shows the same 1 ms. Drop this line if you
+#    never pass --reset-port: the hidraw rule above is the whole requirement.
 #
 # TAG+="uaccess" grants access to the active logind session, so no group
 # membership is required on a normal desktop. Without logind (SSH, old

@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] — 2026-10-15
+
+### Changed
+- **Breaking:** `rate device HZ --persist` no longer resets the port. The reset
+  existed to make the host re-read the descriptor, and the measurement says the
+  descriptor does not follow the stored interval: `bInterval` stays `01` with
+  either code stored, on both sides of a reset the kernel logged as real. What it
+  cost was a second udev rule granting access to the whole USB device node, and a
+  second with the entire receiver — keyboard included — off the bus. The rate is
+  changed by the live interval packets, which are sent either way; the stored code
+  is what the mouse boots with. `--reset-port` asks for the re-enumeration when
+  someone wants it (verified: the kernel's reset counter stays put without the
+  flag and goes up by one with it).
+- **Breaking:** `--no-reset` is gone, because it asked for what is now the
+  default. Anyone passing it gets a usage error rather than a silent surprise.
+- The udev `usb_device` rule is now optional: only `--reset-port` needs it, so a
+  system that never resets the port can install the `hidraw` rule alone.
+- `--timeout-ms` and `--tries` on every command that talks to the device. This is
+  the status-bar story: an awake mouse answers in single-digit milliseconds, so
+  `--tries 1 --timeout-ms 150` reaches "the mouse is asleep" instead of waiting
+  out the write-grade default of four attempts. Measured: `status --json` costs
+  62 ms end to end, 34 ms of which is interpreter startup.
+
 ## [3.0.0] — 2026-10-15
 
 The device commands stopped using pyusb. They reach the config interface
@@ -137,8 +160,8 @@ mismatch on a write that worked — never a silent wrong value — and
   which reads like "the memory is empty". It is now an error with a message.
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
-  descriptors captured from the hardware), the lock, the signal handling and the
-  JSON documents: 219 in total.
+  descriptors captured from the hardware), the lock, the signal handling, the
+  opt-in reset and the JSON documents: 226 in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.

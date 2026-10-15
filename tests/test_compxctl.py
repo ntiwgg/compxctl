@@ -1380,11 +1380,13 @@ def test_reenumerate_is_skipped_when_nothing_was_written(tmp_path: Path) -> None
     assert compxctl._reenumerate(find_mouse(tmp_path), False, enabled=True) == ("skipped", None)
 
 
-def test_reenumerate_can_be_turned_off(tmp_path: Path) -> None:
-    """--no-reset keeps the re-plug a human step, and the output says so."""
+def test_reenumerate_is_opt_in(tmp_path: Path) -> None:
+    """Not resetting is the default: the descriptor does not follow the stored
+    code anyway, and the whole receiver would drop off the bus for nothing."""
     mouse = find_mouse(tmp_path)
-    assert compxctl._reenumerate(mouse, True, enabled=False) == ("manual", None)
+    assert compxctl._reenumerate(mouse, True, enabled=False) == ("not-requested", None)
     assert compxctl._reenumerate(mouse, False, enabled=False) == ("skipped", None)
+    assert compxctl._reenumerate(mouse, False, enabled=True) == ("skipped", None)
 
 
 def test_reenumerate_needs_the_device_back_to_call_it_ok(tmp_path: Path, monkeypatch) -> None:
@@ -1519,7 +1521,7 @@ def _applied(**overrides) -> compxctl.AppliedRate:
     return compxctl.AppliedRate(**{**fields, **overrides})
 
 
-def test_applied_rate_to_device_writes_and_resets(tmp_path: Path, monkeypatch) -> None:
+def test_applied_rate_writes_and_leaves_the_port_alone(tmp_path: Path, monkeypatch) -> None:
     mouse = find_mouse(tmp_path)
     io = FakeHidrawIO(
         [
@@ -1531,15 +1533,31 @@ def test_applied_rate_to_device_writes_and_resets(tmp_path: Path, monkeypatch) -
         ]
     )
     resets: list[Path] = []
-    monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
+    original = compxctl.HidrawSession
+    monkeypatch.setattr(compxctl, "HidrawSession", lambda m=None, **k: original(m, io=io, **k))
     monkeypatch.setattr(compxctl, "reset_usb_device", lambda m, **k: resets.append(m.sysfs_dir))
     monkeypatch.setattr(compxctl, "wait_for_mouse", lambda name, **k: mouse)
 
     applied = compxctl.apply_rate(mouse, 1000, "device", persist=True)
     assert applied.eeprom_changed is True
-    assert applied.reset == "ok"
-    assert resets == [mouse.sysfs_dir]
+    assert applied.reset == "not-requested"
+    assert resets == []  # the receiver stays on the bus unless asked otherwise
     assert io.sent[0] == compxctl.LIVE_PACKETS[1000][0]
+
+    # and with --reset-port it does re-enumerate
+    io2 = FakeHidrawIO(
+        [
+            _live_ack(0x01),
+            None,
+            _read_reply(0x0000, bytes((0x08, 0x4D))),
+            _write_ack(0x0000, bytes((0x01, 0x54))),
+            _read_reply(0x0000, bytes((0x01, 0x54))),
+        ]
+    )
+    monkeypatch.setattr(compxctl, "HidrawSession", lambda m=None, **k: original(m, io=io2, **k))
+    applied = compxctl.apply_rate(mouse, 1000, "device", persist=True, reenumerate=True)
+    assert (applied.eeprom_changed, applied.reset) == (True, "ok")
+    assert resets == [mouse.sysfs_dir]
 
 
 def test_applied_rate_to_host_needs_no_device(tmp_path: Path, monkeypatch) -> None:
@@ -1575,7 +1593,11 @@ def test_applied_rate_to_both_writes_both(tmp_path: Path, monkeypatch) -> None:
 
     applied = compxctl.apply_rate(mouse, 1000, "both", persist=True)
     assert poll.read_text().strip() == "1"
-    assert (applied.host_interval_ms, applied.eeprom_changed, applied.reset) == (1, True, "ok")
+    assert (applied.host_interval_ms, applied.eeprom_changed, applied.reset) == (
+        1,
+        True,
+        "not-requested",
+    )
 
 
 def test_applied_rate_refuses_the_device_without_persist(tmp_path: Path, monkeypatch) -> None:
@@ -1637,9 +1659,10 @@ def test_applied_text_is_quiet_when_the_reset_was_skipped(tmp_path: Path) -> Non
     assert all("Re-plug" not in line for line in text)
 
 
-def test_applied_text_asks_for_the_replug_with_no_reset(tmp_path: Path) -> None:
-    text = " ".join(compxctl.applied_text(_applied(reset="manual"), find_mouse(tmp_path)))
-    assert "Re-plug the mouse" in text
+def test_applied_text_says_the_port_was_left_alone(tmp_path: Path) -> None:
+    text = " ".join(compxctl.applied_text(_applied(reset="not-requested"), find_mouse(tmp_path)))
+    assert "Rate applied now" in text
+    assert "--reset-port" in text
 
 
 def test_applied_text_warns_when_the_device_stays_away(tmp_path: Path) -> None:
@@ -1677,11 +1700,27 @@ def test_parser_rejects_a_target_without_a_rate() -> None:
     assert excinfo.value.code == 2
 
 
-def test_parser_knows_the_json_and_no_reset_flags() -> None:
-    args = compxctl.build_parser().parse_args(["rate", "device", "500", "--persist", "--json", "--no-reset"])
-    assert (args.json, args.no_reset) == (True, True)
+def test_parser_knows_the_json_and_reset_port_flags() -> None:
+    args = compxctl.build_parser().parse_args(
+        ["rate", "device", "500", "--persist", "--json", "--reset-port"]
+    )
+    assert (args.json, args.reset_port) == (True, True)
     for command in ("status", "battery", "dpi"):
         assert compxctl.build_parser().parse_args([command, "--json"]).json is True
+
+
+@pytest.mark.parametrize("command", ["rate", "status", "dpi", "battery", "probe"])
+def test_every_device_command_accepts_a_shorter_patience(command: str) -> None:
+    """`--tries 1 --timeout-ms 150` is the pair a status bar wants."""
+    args = compxctl.build_parser().parse_args([command, "--tries", "1", "--timeout-ms", "150"])
+    assert (args.tries, args.timeout_ms) == (1, 150)
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_patience_flags_reject_nonsense(bad: str) -> None:
+    for flag in ("--tries", "--timeout-ms"):
+        with pytest.raises(SystemExit):
+            compxctl.build_parser().parse_args(["status", flag, bad])
 
 
 def test_parser_dpi_accepts_the_list_literal() -> None:
@@ -2036,12 +2075,13 @@ def test_rate_apply_json_carries_the_action_and_the_state(monkeypatch, capsys, t
     )
     monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
     monkeypatch.setattr(compxctl, "read_mousepoll", lambda path=None: 0)
-    monkeypatch.setattr(compxctl, "reset_usb_device", lambda *a, **k: Path("/dev/bus/usb/003/002"))
-    monkeypatch.setattr(compxctl, "wait_for_mouse", lambda name, **k: mouse)
+    monkeypatch.setattr(
+        compxctl, "reset_usb_device", lambda *a, **k: pytest.fail("must not reset by default")
+    )
     assert compxctl.main(["rate", "device", "1000", "--persist", "--json"]) == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["applied"]["eeprom_changed"] is True
-    assert doc["applied"]["reset"] == "ok"
+    assert doc["applied"]["reset"] == "not-requested"
     assert doc["polling"]["advertised_rate_hz"] == 1000
 
 
@@ -2101,12 +2141,37 @@ def test_the_sigterm_handler_raises_the_shared_interrupt() -> None:
     assert compxctl.Interrupted(signal.SIGINT).exit_code == 130
 
 
-def test_probe_refuses_a_window_that_is_not_a_window(monkeypatch, capsys, tmp_path: Path) -> None:
-    """`--length 0` used to print nothing and exit 0, which reads like success."""
-    assert compxctl.main(["probe", "--start", "0x10", "--length", "0"]) == 1
-    assert "at least 1 byte" in capsys.readouterr().err
-    assert compxctl.main(["probe", "--start", "0x10", "--length", "-8"]) == 1
-    assert "at least 1 byte" in capsys.readouterr().err
+def test_probe_refuses_a_window_that_is_not_a_window(capsys) -> None:
+    """`--length 0` used to print nothing and exit 0, which reads like success.
+
+    The command line rejects it as a usage error (exit 2); `cmd_probe` keeps its
+    own check for callers that build the arguments themselves.
+    """
+    for bad in ("0", "-8"):
+        with pytest.raises(SystemExit) as excinfo:
+            compxctl.main(["probe", "--start", "0x10", "--length", bad])
+        assert excinfo.value.code == 2
+        assert "at least 1" in capsys.readouterr().err
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    args = compxctl.build_parser().parse_args(["probe"])
+    args.length = 0
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(compxctl, "session_for", lambda *a, **k: FakeSession())
+    try:
+        with pytest.raises(RuntimeError, match="at least 1 byte"):
+            compxctl.cmd_probe(args)
+    finally:
+        monkeypatch.undo()
 
 
 def test_plain_error_goes_to_stderr(monkeypatch, capsys) -> None:

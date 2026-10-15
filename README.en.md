@@ -147,19 +147,34 @@ The tool detects which case you are in (`usbhid_is_builtin()` reads
 machine this was developed on, `usbhid` is built in and a pre-existing
 `/etc/modprobe.d/mousepoll.conf` was doing nothing at all.
 
-`rate device HZ --persist` sends two live interval packets and one EEPROM write,
-reads the value back, and **resets the port itself** instead of asking you to
-crawl under the desk and re-plug the receiver:
+`rate device HZ --persist` sends two live interval packets, one EEPROM write, and
+reads the value back:
 
 ```console
 $ compxctl rate device 500 --persist
+Device EEPROM updated to 500 Hz (0x02).
+  Rate applied now; the stored value is what the mouse boots with. The port was not reset (--reset-port does that).
+```
+
+The port is **not** reset by default, and the measurement is why: the reset was
+meant to make the host re-read the descriptor, but the descriptor does not follow
+the stored code — `bInterval` stays `01` with either code, on both sides of a
+reset the kernel logged as real. Its price was real: a second udev rule granting
+access to the *whole* USB device node, and a second during which the entire
+receiver leaves the bus — keyboard included, if one shares it. The rate is changed
+by the live packets, and they go out either way. When the re-enumeration is
+actually wanted (say, to see what the host reports), ask for it:
+
+```console
+$ compxctl rate device 500 --persist --reset-port
 Device EEPROM updated to 500 Hz (0x02).
   Port reset: the receiver re-enumerated, and the host re-read the descriptors; the endpoint advertises 1000 Hz (1ms, ep_81).
   That is expected: on this unit the stored interval does not change the endpoint, which stays at 1ms — the stored value is what the device itself sends at.
 ```
 
-It refuses to run without `--persist`; when the stored value already matches, the
-EEPROM is not written and the port is left alone. The live packets still go out,
+It refuses to run without `--persist`; `--reset-port` additionally re-enumerates.
+When the stored value already matches, the EEPROM is not written and the port is
+left alone. The live packets still go out,
 and that is not redundancy: they set the rate **now**, while the EEPROM holds the
 one the mouse boots with. The two states are independent — another program may
 have changed the live rate, or an earlier run may have stopped between the
@@ -270,7 +285,10 @@ What you can rely on:
 
 `status --json` does not touch the kernel driver and does not disturb the mouse,
 so a status bar can call it every second — while the device answers, that is a few
-milliseconds. If the mouse is switched off or asleep, the tool does not ask four
+milliseconds (measured: 62 ms including interpreter startup, 34 ms of which is
+Python itself). For a bar there is also a pair of impatience flags:
+`--tries 1 --timeout-ms 150`. An awake mouse answers in single-digit
+milliseconds, so waiting 4 × 500 ms to learn that it is asleep is wasted time. If the mouse is switched off or asleep, the tool does not ask four
 times over: after the first run of timeouts (4 attempts × 500 ms) it marks the
 device as silent, skips the remaining reads and says so in `warnings`. That is
 ~2 s instead of ~14, and the document honestly carries `null` where a value was
@@ -298,9 +316,10 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uac
 file exists and differs, the previous version is kept beside it as
 `99-compx-mouse.rules.bak.<date>`, and `--uninstall` says where those copies are.
 
-`TAG+="uaccess"` covers an active logind session. The `usb_device` rule is only
-needed for the port reset: without it, `rate device --persist` still writes the
-value, skips the reset and says so. Note that a `GROUP="users"` fallback is a
+`TAG+="uaccess"` covers an active logind session. The `usb_device` rule is needed
+**only** for `--reset-port`: everything else works without it, and the reset says
+so when it has no permission. If you never want the re-enumeration, the single
+`hidraw` line is enough — fewer privileges and less surface. Note that a `GROUP="users"` fallback is a
 trap: device access does not go through that group and membership is whatever
 the installer decided, so where nobody is a member the rule silently grants
 nothing — check with `id -nG`. If you installed the 2.x rules, reinstall them —
@@ -332,7 +351,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-219 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+226 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:
@@ -385,9 +404,9 @@ All of the following was measured on an Ardor Gaming Ulta (`25a7:fa7b`), kernel
 * The lock serializes `compxctl` runs only. Another program opening the same node
   does not lose frames (every opener gets its own copies), but the mutual
   visibility of foreign replies remains: the protocol carries no sequence number.
-* The port reset drops **the whole receiver** off the bus. If the same receiver
-  also carries a keyboard, that keyboard disappears for a second — which is what
-  `--no-reset` is for.
+* `--reset-port` drops **the whole receiver** off the bus. If the same receiver
+  also carries a keyboard, that keyboard disappears for a second — which is why
+  the port is not touched by default.
 * The tool does not measure the rate the mouse actually reports at: that needs
   mouse movement, and counting input events the way the removed `check` command
   did is a way to get a wrong number.

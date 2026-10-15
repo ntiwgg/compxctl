@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, NamedTuple, Sequence, TypeVar
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 
 # Version of the `--json` documents. Bump it when a key changes meaning or
 # disappears; adding a key does not bump it.
@@ -888,11 +888,17 @@ class HidrawSession:
         mouse: Mouse | None = None,
         *,
         timeout_ms: int = READ_TIMEOUT_MS,
+        tries: int = READ_ATTEMPTS,
         io: type[HidrawIO] = HidrawIO,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._mouse = mouse
         self.timeout_ms = timeout_ms
+        # How many times one command may be sent. The default is tuned for a
+        # write that must not be lost; a status bar that would rather have a fast
+        # "the mouse is asleep" can lower it, and `--tries 1 --timeout-ms 150`
+        # is the pair the README suggests for that.
+        self.tries = max(1, tries)
         self._io = io
         self._clock = clock
         self._fd: int | None = None
@@ -1070,7 +1076,7 @@ class HidrawSession:
 
         detail = timeout_message
         foreign = False
-        for _ in range(READ_ATTEMPTS):
+        for _ in range(self.tries):
             self._drain_pending()
             self.send(packet)
             result = self._await_reply(reject)
@@ -1092,14 +1098,14 @@ class HidrawSession:
             )
             self._silent_reason = (
                 f"no answer within {self.timeout_ms} ms per attempt, "
-                f"{READ_ATTEMPTS} attempts in a row"
+                f"{self.tries} attempts in a row"
             )
             raise RuntimeError(
                 f"{timeout_message} — {silence}. Is the mouse switched off or "
                 "asleep? (The rest of this command's readouts are skipped.)"
             )
         raise RuntimeError(
-            f"{detail} (tried {READ_ATTEMPTS} times; is another program "
+            f"{detail} (tried {self.tries} times; is another program "
             "talking to the mouse?)"
         )
 
@@ -1508,6 +1514,20 @@ def _describe_rate(mouse: Mouse, mousepoll_ms: int | None) -> list[str]:
     return lines
 
 
+def session_for(args: argparse.Namespace, mouse: Mouse | None = None) -> HidrawSession:
+    """The session every device command uses, with the flags it was given.
+
+    `--timeout-ms` and `--tries` exist for the caller that would rather hear
+    "the mouse is asleep" quickly than wait out the write-grade default: a status
+    bar polling every few seconds has no use for four attempts.
+    """
+    return HidrawSession(
+        mouse,
+        timeout_ms=getattr(args, "timeout_ms", READ_TIMEOUT_MS),
+        tries=getattr(args, "tries", READ_ATTEMPTS),
+    )
+
+
 def cmd_rate(args: argparse.Namespace) -> int:
     """Show the polling rate, or change it on the host and/or the device."""
     mouse = _require_mouse()
@@ -1535,7 +1555,9 @@ def cmd_rate(args: argparse.Namespace) -> int:
         rate,
         target,
         persist=args.persist,
-        reenumerate=not getattr(args, "no_reset", False),
+        reenumerate=getattr(args, "reset_port", False),
+        timeout_ms=args.timeout_ms,
+        tries=args.tries,
     )
     fresh = _fresh_mouse(mouse.sysfs_dir.name)
     mousepoll_ms = read_mousepoll()
@@ -1566,12 +1588,19 @@ class AppliedRate:
     rate_hz: int
     host_interval_ms: int | None
     eeprom_changed: bool | None
-    reset: str  # "ok" | "failed" | "skipped" | "manual"
+    reset: str  # "ok" | "failed" | "skipped" | "not-requested"
     reset_error: str | None
 
 
 def apply_rate(
-    mouse: Mouse, rate: int, target: str, *, persist: bool, reenumerate: bool = True
+    mouse: Mouse,
+    rate: int,
+    target: str,
+    *,
+    persist: bool,
+    reenumerate: bool = False,
+    timeout_ms: int = READ_TIMEOUT_MS,
+    tries: int = READ_ATTEMPTS,
 ) -> AppliedRate:
     """Carry out `rate host|device|both`, reporting what actually happened."""
     if target in ("device", "both") and not persist:
@@ -1588,7 +1617,7 @@ def apply_rate(
 
     if target not in ("device", "both"):
         return AppliedRate(target, rate, host_interval_ms, None, "skipped", None)
-    with HidrawSession(mouse) as session:
+    with HidrawSession(mouse, timeout_ms=timeout_ms, tries=tries) as session:
         apply_live_rate(session, rate)
         changed = session.persist_rate(rate)
 
@@ -1599,8 +1628,15 @@ def apply_rate(
 def _reenumerate(mouse: Mouse, changed: bool, *, enabled: bool) -> tuple[str, str | None]:
     """Reset the port so the host re-reads the descriptors. (status, error).
 
-    "skipped" means there was nothing to reset for; "manual" means --no-reset
-    asked for the re-plug to stay a human step, and the caller still says so.
+    Off by default, and the measurement is why: on the verified unit the
+    endpoint interval does not follow the stored interval code, so re-reading the
+    descriptors shows the same `1ms` it showed before, while the whole receiver —
+    keyboard included, if one shares it — drops off the bus for a second. The
+    live interval packets are what change the rate, and they are sent either way.
+    `--reset-port` asks for the re-enumeration when someone actually wants it.
+
+    "skipped" means there was nothing to write in the first place;
+    "not-requested" means the write happened and the port was left alone.
     """
     if not changed:
         # Nothing was written: the stored interval and the live packets are
@@ -1608,7 +1644,7 @@ def _reenumerate(mouse: Mouse, changed: bool, *, enabled: bool) -> tuple[str, st
         # does not need to disappear off the bus for the sake of it.
         return "skipped", None
     if not enabled:
-        return "manual", None
+        return "not-requested", None
     try:
         reset_usb_device(mouse)
     except RuntimeError as exc:
@@ -1675,10 +1711,13 @@ def _reenumeration_text(applied: AppliedRate, fresh: Mouse | None) -> list[str]:
     detail = f"{endpoint.interval_raw or '?'}, {endpoint.name}" if endpoint else "no endpoint"
     if applied.reset == "skipped":
         return []
-    if applied.reset == "manual":
+    if applied.reset == "not-requested":
+        # The live packets already changed the rate; the EEPROM keeps it for the
+        # next power-up. Nothing needs re-plugging, and --reset-port is named for
+        # the case where someone wants the descriptors re-read anyway.
         return [
-            "  Re-plug the mouse (or the receiver) to make the host re-read the "
-            "descriptors.",
+            "  Rate applied now; the stored value is what the mouse boots with. "
+            "The port was not reset (--reset-port does that).",
         ]
     if applied.reset == "failed":
         return [
@@ -1773,7 +1812,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     """Read-only snapshot: sysfs rate plus the device's own readouts."""
     mouse = _require_mouse()
     mousepoll_ms = read_mousepoll()
-    with HidrawSession(mouse) as session:
+    with session_for(args, mouse) as session:
         readouts = collect_readouts(session)
 
     if getattr(args, "json", False):
@@ -1800,7 +1839,7 @@ def cmd_dpi(args: argparse.Namespace) -> int:
     mouse = _require_mouse()
 
     if value is None or value == "list":
-        with HidrawSession(mouse) as session:
+        with session_for(args, mouse) as session:
             slots = session.dpi_slots()
             active = session.active_dpi_level()
         active_slot = active_slot_for_index(active[0]) if active else None
@@ -1820,7 +1859,7 @@ def cmd_dpi(args: argparse.Namespace) -> int:
             print(line)
         return 0
 
-    with HidrawSession(mouse) as session:
+    with session_for(args, mouse) as session:
         code = dpi_code(value)
         if code is None:
             raise RuntimeError("DPI must be a multiple of 50 between 50 and 6400")
@@ -1892,7 +1931,7 @@ def _dpi_table_text(
 
 def cmd_battery(args: argparse.Namespace) -> int:
     mouse = _require_mouse()
-    with HidrawSession(mouse) as session:
+    with session_for(args, mouse) as session:
         percent, charging, state = session.battery()
     if getattr(args, "json", False):
         print_json(
@@ -1919,7 +1958,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
             f"(0x0000..0x{CONFIG_MEMORY_BYTES - 1:04X})"
         )
     data = bytearray()
-    with HidrawSession() as session:
+    with session_for(args) as session:
         for offset in range(0, length, PROBE_BLOCK_BYTES):
             chunk_length = min(PROBE_BLOCK_BYTES, length - offset)
             chunk = session.read(start + offset, chunk_length)
@@ -1955,6 +1994,13 @@ def cmd_probe(args: argparse.Namespace) -> int:
 # ==========================================================================
 # CLI
 # ==========================================================================
+
+
+def _parse_positive(text: str) -> int:
+    value = _parse_int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
 
 
 def _parse_int(text: str) -> int:
@@ -1997,8 +2043,9 @@ def build_parser() -> argparse.ArgumentParser:
             "override and the effective rate. `rate host HZ` writes "
             "usbhid.mousepoll (global, reversible, root). `rate device HZ "
             "--persist` rewrites the device's stored interval through the "
-            "vendor protocol (per-device, persistent, EEPROM wear) and then "
-            "resets the port so the host re-reads it — no re-plug needed."
+            "vendor protocol (per-device, persistent, EEPROM wear). The live "
+            "interval packets take effect immediately; --reset-port additionally "
+            "re-enumerates the receiver so the host re-reads the descriptors."
         ),
     )
     rate.add_argument(
@@ -2011,13 +2058,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="confirm the EEPROM write required by `rate device`",
     )
     rate.add_argument(
-        "--no-reset", action="store_true",
-        help="after --persist, leave the port alone and re-plug by hand instead",
+        "--reset-port", action="store_true",
+        help=(
+            "after --persist, re-enumerate the port so the host re-reads the "
+            "descriptors (needs the usb udev rule; on the verified unit the "
+            "descriptor does not change)"
+        ),
     )
+    _add_timing_flags(rate)
     _add_json_flag(rate)
     rate.set_defaults(func=cmd_rate)
 
     status = subparsers.add_parser("status", help="read-only device snapshot")
+    _add_timing_flags(status)
     _add_json_flag(status)
     status.set_defaults(func=cmd_status)
 
@@ -2025,19 +2078,40 @@ def build_parser() -> argparse.ArgumentParser:
     dpi.add_argument("value", nargs="?", type=_parse_dpi_value, default=None,
                      help="'list' or a DPI multiple of 50 in 50..6400")
     dpi.add_argument("--slot", type=int, default=None, help="write slot S (0..5)")
+    _add_timing_flags(dpi)
     _add_json_flag(dpi)
     dpi.set_defaults(func=cmd_dpi)
 
     battery = subparsers.add_parser("battery", help="read battery level and state")
+    _add_timing_flags(battery)
     _add_json_flag(battery)
     battery.set_defaults(func=cmd_battery)
 
     probe = subparsers.add_parser("probe", help="read config memory (read-only)")
     probe.add_argument("--start", type=_parse_int, default=0x0000)
-    probe.add_argument("--length", type=_parse_int, default=0x40)
+    probe.add_argument("--length", type=_parse_positive, default=0x40)
+    _add_timing_flags(probe)
     probe.set_defaults(func=cmd_probe)
 
     return parser
+
+
+def _add_timing_flags(parser: argparse.ArgumentParser) -> None:
+    """How long one answer may take, and how often to ask.
+
+    Defaults are tuned for a write that must not be lost (4 attempts, 500 ms).
+    A status bar is better served by `--tries 1 --timeout-ms 150`: an awake mouse
+    answers in single-digit milliseconds, so a longer wait only delays the answer
+    "it is asleep".
+    """
+    parser.add_argument(
+        "--timeout-ms", type=_parse_positive, default=READ_TIMEOUT_MS,
+        help=f"wait this long for one answer (default {READ_TIMEOUT_MS})",
+    )
+    parser.add_argument(
+        "--tries", type=_parse_positive, default=READ_ATTEMPTS,
+        help=f"send a command at most this many times (default {READ_ATTEMPTS})",
+    )
 
 
 def _add_json_flag(parser: argparse.ArgumentParser) -> None:
