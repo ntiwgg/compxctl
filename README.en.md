@@ -309,11 +309,41 @@ cannot drift apart in formatting:
 | `contrib/gnome-argos/compx.30s.sh` | `~/.config/argos/` | a GNOME widget (Argos, Guillotine, Executor): battery, DPI, a menu of presets and a way into `tui` |
 | `contrib/waybar/config.jsonc` | into the Waybar config | a `custom/compx` module with a tooltip, `charging`/`discharging`/`asleep` classes and `tui` on middle click |
 | `contrib/polybar/module.ini` | into the Polybar config | `[module/compx]` with the same text and clicks |
+| `contrib/gnome-tray/compx-tray.py` | `~/.local/bin/compx-tray` | a GNOME tray indicator: the battery percentage drawn into the icon, a menu of DPI presets and a way into `tui` |
 
 A sleeping mouse is a state, not an error: the widget keeps its place and says
 `🖱️ —` instead of emptying itself or waiting out `4 × 500 ms`. A full-screen `tui`
 from a panel needs a terminal (`foot -e compxctl tui`) — the panel itself has
 none.
+
+#### The mouse in the GNOME tray
+
+```console
+$ ln -s "$PWD/compxctl.py" ~/.local/bin/compxctl     # the tool in PATH, one copy
+$ install -m 755 contrib/gnome-tray/compx-tray.py ~/.local/bin/compx-tray
+$ cp contrib/gnome-tray/compx-tray.desktop ~/.config/autostart/
+$ compx-tray &                                        # or just log out and in
+```
+
+Why this way rather than "install Argos":
+
+* **Script-running extensions lag behind the shell.** Executor (the maintained
+  Argos fork) supports up to GNOME 50 as of 51, so on 51 it will not install at
+  all. A GNOME desktop already ships `appindicatorsupport`, the extension that
+  draws any StatusNotifierItem in the panel, and that protocol is stable.
+* **Indicator labels do not work in GNOME.** The extension has a
+  [regression with `set_label`](https://bugs.launchpad.net/ubuntu/+source/gnome-shell-extension-appindicator/+bug/2059818):
+  the label stopped being drawn. So the percentage is *painted into the icon*,
+  with its own background so it reads on a light or a dark panel; the tooltip is
+  built from `Title`, and everything else lives in the menu.
+* **It needs only `python-gobject`** with `Gtk 3` and `AyatanaAppIndicator3`,
+  which any GNOME already has. The tool itself gains no dependency.
+
+The menu holds the battery, the active DPI and the rate (read-only), four DPI
+presets with the current one ticked, "Открыть экран (tui)" in a terminal, a
+refresh and a quit. One indicator per session (a `flock`), polling the device
+every 10 seconds with the same `--tries 1 --timeout-ms 150` as the other widgets:
+a sleeping mouse is a `—` badge, not an exception.
 
 ### Machine-readable output: `--json`
 

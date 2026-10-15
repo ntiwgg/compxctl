@@ -208,8 +208,26 @@ $ compxctl tui
 | `contrib/gnome-argos/compx.30s.sh` | `~/.config/argos/` | виджет GNOME (Argos, Guillotine, Executor): батарея, DPI, меню с пресетами и запуском `tui` |
 | `contrib/waybar/config.jsonc` | в конфиг Waybar | модуль `custom/compx` с тултипом, классами `charging`/`discharging`/`asleep` и `tui` по средней кнопке |
 | `contrib/polybar/module.ini` | в конфиг Polybar | `[module/compx]` с тем же текстом и кликами |
+| `contrib/gnome-tray/compx-tray.py` | `~/.local/bin/compx-tray` | индикатор в трее GNOME: проценты батареи прямо в иконке, меню с пресетами DPI и запуском `tui` |
 
 Спящая мышь — это состояние, а не ошибка: виджет остаётся на месте и пишет `🖱️ —`, а не пустеет и не ждёт `4 × 500 мс`. Полноэкранный `tui` из панели запускается через терминал (`foot -e compxctl tui`) — у самой панели терминала нет.
+
+#### Мышь в трее GNOME
+
+```console
+$ ln -s "$PWD/compxctl.py" ~/.local/bin/compxctl     # инструмент в PATH, одной копией
+$ install -m 755 contrib/gnome-tray/compx-tray.py ~/.local/bin/compx-tray
+$ cp contrib/gnome-tray/compx-tray.desktop ~/.config/autostart/
+$ compx-tray &                                        # или просто выйти и войти
+```
+
+Почему именно так, а не «поставить Argos»:
+
+* **Расширения для показа скриптов отстают от оболочки.** Executor (живой форк Argos) на момент GNOME 51 поддерживает до 50-й версии, то есть на 51-й просто не установится. У вас (`GNOME Shell 51.0`, Wayland) уже включён `appindicatorsupport` — расширение, которое рисует в панели любые StatusNotifierItem, и протокол этот стабилен.
+* **Текстовая метка индикатора в GNOME не работает.** У расширения есть [регрессия с `set_label`](https://bugs.launchpad.net/ubuntu/+source/gnome-shell-extension-appindicator/+bug/2059818): метка перестала отображаться. Поэтому процент **нарисован в иконку** — с собственной подложкой, чтобы читалось и на светлой, и на тёмной панели; тултип собирается из `Title`, а всё остальное живёт в меню.
+* **Требуется только `python-gobject`** с `Gtk 3` и `AyatanaAppIndicator3` — это и так есть на любом GNOME. Никаких новых зависимостей у инструмента.
+
+Что в меню: батарея, активный DPI и частота (только чтение), четыре пресета DPI с галочкой на текущем, «Открыть экран (tui)» в терминале, «Обновить» и «Выход». Индикатор один на сессию (`flock`), опрашивает устройство раз в 10 секунд теми же `--tries 1 --timeout-ms 150`, что и остальные виджеты: спящая мышь — это значок `—`, а не исключение.
 
 ### Машиночитаемый вывод: `--json`
 

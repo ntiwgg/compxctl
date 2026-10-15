@@ -55,7 +55,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, NamedTuple, Sequence, TypeVar
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 # Version of the `--json` documents. Bump it when a key changes meaning or
 # disappears, and when the set of values a key can take changes — 2 dropped the

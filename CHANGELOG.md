@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] — 2026-10-16
+
+### Added
+- `contrib/gnome-tray/`: the mouse in the GNOME tray, as a StatusNotifierItem
+  (`compx-tray.py`) plus an autostart entry. It exists because the Argos road is
+  closed on current shells — Executor, the maintained fork, supports up to GNOME
+  50, so on 51 there is nothing to install — while `appindicatorsupport` already
+  ships with the desktop and renders this protocol. Two measured details shape
+  it: the extension's label support is broken (Ubuntu bug 2059818), so the
+  battery percentage is painted into the icon with its own background instead of
+  set as a label; and the tooltip a panel shows comes from `Title`, since the
+  second argument of `set_icon_full` is an accessible description — the ToolTip
+  property stayed empty when the text was passed there. The menu carries the
+  readings, four DPI presets with the current one ticked, the interactive screen
+  in a terminal, a refresh and a quit; one instance per session is enforced with
+  a `flock`, and the device is read with the same `--tries 1 --timeout-ms 150`
+  the other widgets use.
+
 ## [4.1.0] — 2026-10-16
 
 ### Added
