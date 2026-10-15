@@ -812,6 +812,7 @@ class HidrawSession:
         self._io = io
         self._clock = clock
         self._fd: int | None = None
+        self._lock_fd: int | None = None
         self._silent_reason: str | None = None
 
     @property
@@ -830,30 +831,51 @@ class HidrawSession:
         mistaken = interface_refusal(path, descriptor)
         if mistaken is not None:
             raise RuntimeError(mistaken)
-        try:
-            self._fd = self._io.open(path)
-        except PermissionError as exc:
-            raise RuntimeError(
-                f"No permission to open {path}. The device commands need access "
-                'to the hidraw node: install 99-compx-mouse.rules (TAG+="uaccess") '
-                "or run once with sudo."
-            ) from exc
-        except OSError as exc:
-            raise RuntimeError(f"Cannot open {path}: {exc}") from exc
-        if not self._io.lock(self._fd, LOCK_WAIT_MS):
-            self._io.close(self._fd)
-            self._fd = None
+        # Lock on a descriptor of its own, and open the one that will be read
+        # only once the lock is held. An opener is subscribed to a copy of every
+        # input report from the moment it opens, so a process that waits for the
+        # lock with its reading descriptor already open finds replies to the
+        # previous session at the head of its queue — and since the protocol has
+        # no sequence number, a same-header frame from that session is
+        # indistinguishable from its own answer.
+        lock_fd = self._open(path, "lock")
+        if not self._io.lock(lock_fd, LOCK_WAIT_MS):
+            self._io.close(lock_fd)
             raise RuntimeError(
                 f"Another compxctl is talking to the mouse: the lock on {path} is "
                 f"held and did not come free within {LOCK_WAIT_MS} ms. Try again in "
                 "a moment."
             )
+        try:
+            self._fd = self._open(path, "read")
+        except RuntimeError:
+            self._io.close(lock_fd)
+            raise
+        self._lock_fd = lock_fd
         return self
+
+    def _open(self, path: Path, what: str) -> int:
+        """Open the node, translating the two ways it usually fails."""
+        try:
+            return self._io.open(path)
+        except PermissionError as exc:
+            raise RuntimeError(
+                f"No permission to open {path} ({what}). The device commands need "
+                "access to the hidraw node: install 99-compx-mouse.rules "
+                '(TAG+="uaccess") or run once with sudo.'
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"Cannot open {path} ({what}): {exc}") from exc
 
     def __exit__(self, *exc_info: object) -> None:
         fd, self._fd = self._fd, None
         if fd is not None:
             self._io.close(fd)
+        lock_fd, self._lock_fd = self._lock_fd, None
+        if lock_fd is not None:
+            # Closing it releases the lock: the kernel does that on close or on
+            # process death, so a killed compxctl cannot leave the device locked.
+            self._io.close(lock_fd)
 
     # -- transfers ---------------------------------------------------------
 

@@ -91,14 +91,18 @@ mismatch on a write that worked — never a silent wrong value — and
 - Concurrent runs are serialized with `flock` on the node. Measured first: hidraw
   gives every opener its own copy of every input report, so nothing is stolen
   from anyone — but two compxctl processes can each read the other's frames, and
-  the protocol has no sequence number to tell them apart.
+  the protocol has no sequence number to tell them apart. The lock is taken on a
+  descriptor of its own and the reading descriptor is opened only once the lock
+  is held, because being subscribed to those copies starts at `open()`: a
+  process waiting for the lock with its reader already open would queue the
+  previous session's replies ahead of its own.
 - A device that has gone quiet is asked once, not four times: after the first run
   of timeouts the session marks the device silent, `status` skips the remaining
   readouts and says so in `warnings`. A sleeping mouse now costs ~2 s instead of
   ~14 s, which is what makes polling it from a status bar reasonable.
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
-  descriptors captured from the hardware), the lock and the JSON documents: 199
+  descriptors captured from the hardware), the lock and the JSON documents: 202
   in total.
 
 ### Removed

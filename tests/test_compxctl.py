@@ -677,19 +677,24 @@ class FakeHidrawIO:
         self.closed: list[int] = []
         self.timeouts: list[int] = []
         self.locks: list[tuple[int, int]] = []
+        self.events: list[tuple[str, object]] = []
         self.lock_available = lock_available
         self.fail_send: OSError | None = None
 
-    def lock(self, fd: int, timeout_ms: int) -> bool:
-        self.locks.append((fd, timeout_ms))
-        return self.lock_available
-
     def open(self, path: Path) -> int:
         self.opened.append(path)
-        return 3
+        fd = 2 + len(self.opened)  # 3, then 4: the lock descriptor, then the reader
+        self.events.append(("open", fd))
+        return fd
+
+    def lock(self, fd: int, timeout_ms: int) -> bool:
+        self.locks.append((fd, timeout_ms))
+        self.events.append(("lock", fd))
+        return self.lock_available
 
     def close(self, fd: int) -> None:
         self.closed.append(fd)
+        self.events.append(("close", fd))
 
     def set_feature(self, fd: int, frame: bytes) -> None:
         if self.fail_send is not None:
@@ -761,8 +766,8 @@ def test_session_opens_the_config_interface_node(tmp_path: Path) -> None:
     io = FakeHidrawIO()
     with make_session(io, tmp_path):
         pass
-    assert io.opened == [Path("/dev/hidraw1")]
-    assert io.closed == [3]
+    assert io.opened == [Path("/dev/hidraw1")] * 2  # one to lock, one to read
+    assert io.closed == [4, 3]  # the reader closes first, then the lock
 
 
 def test_session_takes_an_advisory_lock(tmp_path: Path) -> None:
@@ -774,12 +779,34 @@ def test_session_takes_an_advisory_lock(tmp_path: Path) -> None:
     assert io.locks == [(3, compxctl.LOCK_WAIT_MS)]
 
 
+def test_the_reading_descriptor_is_opened_only_after_the_lock(tmp_path: Path) -> None:
+    """Otherwise the wait itself fills the queue with the previous session's
+    replies, and the protocol cannot tell them from the answer being asked for."""
+    io = FakeHidrawIO()
+    with make_session(io, tmp_path):
+        pass
+    assert [event for event in io.events if event[0] != "close"] == [
+        ("open", 3),  # the descriptor the lock is taken on
+        ("lock", 3),
+        ("open", 4),  # the one that will be read, subscribed when already locked
+    ]
+
+
+def test_a_locked_node_is_not_left_open(tmp_path: Path) -> None:
+    io = FakeHidrawIO(lock_available=False)
+    with pytest.raises(RuntimeError, match="Another compxctl"):
+        with make_session(io, tmp_path):
+            pass
+    assert io.closed == [3]  # only the lock descriptor existed, and it is closed
+    assert io.events == [("open", 3), ("lock", 3), ("close", 3)]
+
+
 def test_session_reports_a_lock_held_by_another_process(tmp_path: Path) -> None:
     io = FakeHidrawIO(lock_available=False)
     with pytest.raises(RuntimeError, match="Another compxctl"):
         with make_session(io, tmp_path):
             pass
-    assert io.closed == [3]  # the node is not left open on the way out
+    assert io.opened == [Path("/dev/hidraw1")]  # never got as far as reading
 
 
 def test_session_refuses_a_node_that_is_not_the_vendor_interface(tmp_path: Path) -> None:

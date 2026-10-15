@@ -91,7 +91,16 @@ of every input report (measured: a process reading the node alongside the tool
 saw all the replies, and the tool was unaffected). The flip side is that two
 compxctl instances can see each other's frames and the protocol has no sequence
 number, so the node is held under `flock` for the duration of a request: a second
-run waits up to two seconds and then says the node is busy. The kernel drops the
+run waits up to two seconds and then says the node is busy (measured: 15 out of
+15 concurrent runs went through, the second one waiting and then working).
+
+The lock is taken on a descriptor of its own, and the descriptor that gets read
+is opened only afterwards. Waiting with the reading descriptor already open
+would spoil the queue by itself: an opener is subscribed to report copies at
+`open()` time, so it would find the previous session's replies at the head of
+its queue — and without a sequence number in the protocol there is nothing to
+tell them from its own. The queue is still drained before every command, but
+now there is nothing to drain. The kernel drops the
 lock when the descriptor closes or the process dies, so nothing goes stale. It
 does not constrain other software that opens the same node — it is a warning, not
 a fence.
@@ -293,7 +302,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-199 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+202 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:
