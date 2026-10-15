@@ -231,8 +231,9 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uac
 `TAG+="uaccess"` covers an active logind session. The `usb_device` rule is only
 needed for the port reset: without it, `rate device --persist` still writes the
 value, skips the reset and says so. Note that a `GROUP="users"` fallback is a
-portability trap: that group does not exist on Fedora or Arch, so the rule
-silently grants nothing there. If you installed the 2.x rules, reinstall them —
+trap: device access does not go through that group and membership is whatever
+the installer decided, so where nobody is a member the rule silently grants
+nothing — check with `id -nG`. If you installed the 2.x rules, reinstall them —
 they did not cover `hidraw`.
 
 ## Supported devices

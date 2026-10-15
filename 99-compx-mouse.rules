@@ -13,8 +13,9 @@
 #
 # TAG+="uaccess" grants access to the active logind session, so no group
 # membership is required on a normal desktop. Without logind (SSH, old
-# distros), run the device commands once with sudo instead — do not add
-# GROUP="users": that group does not exist on Fedora or Arch and the rule would
-# then silently grant nothing.
+# distros), run the device commands once with sudo instead — do not fall back to
+# GROUP="users": device access does not go through that group, membership in it
+# is whatever the installer decided, and where nobody is a member the rule
+# silently grants nothing. Check with: id -nG
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uaccess"
