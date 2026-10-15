@@ -1846,6 +1846,17 @@ def test_json_error_is_a_document_too(monkeypatch, capsys) -> None:
     assert captured.err == ""
 
 
+def test_keyboard_interrupt_exits_with_130(monkeypatch, capsys) -> None:
+    """Ctrl+C is a documented exit code, not a traceback."""
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(compxctl, "find_mouses", interrupted)
+    assert compxctl.main(["rate"]) == 130
+    assert "Interrupted" in capsys.readouterr().err
+
+
 def test_plain_error_goes_to_stderr(monkeypatch, capsys) -> None:
     monkeypatch.setattr(compxctl, "find_mouses", lambda *a, **k: [])
     assert compxctl.main(["status"]) == 1
