@@ -87,6 +87,19 @@ CONFIG_INTERFACE_CLASS = (0x03, 0x01, 0x01)
 COMPX_REPLY_REPORT_ID = 0x09
 HIDRAW_READ_BYTES = 64
 
+# How long to wait for another compxctl to finish with the device. The lock is
+# advisory and released by the kernel when a process exits, so this can be
+# short: it only has to outlast a command, not a crash.
+LOCK_WAIT_MS = 2000
+LOCK_POLL_MS = 50
+
+# The vendor report ids the reverse-engineered protocol needs, as declared by
+# the config interface's own report descriptor: 0x08 is a FEATURE report (every
+# read, write and the battery request) and 0x09 is the INPUT report the firmware
+# answers with. 0x06 is the first live interval packet, also FEATURE.
+COMPX_VENDOR_REPORT_ID = 0x08
+COMPX_LIVE_REPORT_ID = 0x06
+
 # Ceiling on the frames thrown away before a command goes out. The queue holds
 # acknowledgements of earlier commands, not a stream, so this is a guard against
 # a device that never stops talking rather than a working limit.
@@ -250,6 +263,7 @@ class Mouse:
     interface_dir: Path | None
     config_interface_dir: Path | None
     hidraw_path: Path | None
+    hidraw_descriptor: Path | None
     endpoint: MouseEndpoint | None
 
     @property
@@ -298,14 +312,90 @@ def hidraw_node_for(
     interface only.
     """
     nodes = [(entry.name, (entry / "device").resolve()) for entry in sorted(root.glob("hidraw*"))]
+    candidates: list[Path] = []
     for directory in interface_dirs:
         if directory is None:
             continue
         resolved = directory.resolve()
-        for name, device in nodes:
-            if resolved in device.parents:
-                return DEV_ROOT / name
-    return None
+        candidates.extend(
+            DEV_ROOT / name for name, device in nodes if resolved in device.parents
+        )
+
+    for candidate in candidates:
+        # The descriptor decides when it can: on an unverified sibling model the
+        # interface numbering may differ, and the reports it declares cannot.
+        descriptor = _read_bytes(root / candidate.name / "device" / "report_descriptor")
+        if declares_vendor_reports(descriptor):
+            return candidate
+    return candidates[0] if candidates else None
+
+
+def _read_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def report_ids(descriptor: bytes) -> dict[str, set[int]]:
+    """Report ids declared by a raw HID report descriptor, per report type.
+
+    A short walk of the item stream is enough for this question: only two things
+    matter, the global Report ID item (0x85) and the main items that consume it
+    (Input 0x80, Output 0x90, Feature 0xB0). Long items (0xFE) are skipped by
+    their own length, so a descriptor that uses them cannot desynchronize the
+    walk.
+    """
+    found: dict[str, set[int]] = {"input": set(), "output": set(), "feature": set()}
+    main_items = {0x8: "input", 0x9: "output", 0xB: "feature"}
+    current = 0
+    index = 0
+    while index < len(descriptor):
+        prefix = descriptor[index]
+        index += 1
+        if prefix == 0xFE:  # long item: 0xFE, size, tag, data
+            if index + 2 > len(descriptor):
+                break
+            index += 2 + descriptor[index]
+            continue
+        size = (0, 1, 2, 4)[prefix & 0x03]
+        kind = (prefix >> 2) & 0x03
+        tag = (prefix >> 4) & 0x0F
+        data = descriptor[index : index + size]
+        index += size
+        if len(data) != size:
+            break
+        if kind == 0x01 and tag == 0x8 and size == 1:  # global: Report ID
+            current = data[0]
+        elif kind == 0x00 and tag in main_items:  # main: Input/Output/Feature
+            found[main_items[tag]].add(current)
+    return found
+
+
+def declares_vendor_reports(descriptor: bytes) -> bool:
+    """Whether an interface declares the reports this protocol talks in."""
+    ids = report_ids(descriptor)
+    return COMPX_VENDOR_REPORT_ID in ids["feature"] and COMPX_REPLY_REPORT_ID in ids["input"]
+
+
+def interface_refusal(node: Path, descriptor: bytes) -> str | None:
+    """Why this node cannot be the vendor config interface — when we can tell.
+
+    The descriptor is the authority, and it is readable by anyone, so a node
+    that declares something else is a mistake worth stopping on before a feature
+    report goes to the wrong interface. An unreadable descriptor says nothing:
+    the protocol then decides, and a wrong node fails loudly on the first reply
+    check instead of being guessed at.
+    """
+    if not descriptor or declares_vendor_reports(descriptor):
+        return None
+    ids = report_ids(descriptor)
+    return (
+        f"{node} is not the vendor config interface: its report descriptor "
+        f"declares feature ids {sorted(ids['feature']) or ['none']} and input ids "
+        f"{sorted(ids['input']) or ['none']}, while the protocol needs "
+        f"0x{COMPX_VENDOR_REPORT_ID:02X} as a feature report. Refusing to talk to it."
+    )
 
 
 def _interface_candidates(device_dir: Path, root: Path) -> list[tuple[Path, InterfaceClasses]]:
@@ -385,6 +475,7 @@ def find_mouses(
 def _mouse_from_device(device_dir: Path, root: Path, hidraw_root: Path) -> Mouse:
     speed_mbps = _speed_mbps(device_dir)
     motion_dir, config_dir = pick_interfaces(_interface_candidates(device_dir, root))
+    hidraw_path = hidraw_node_for((config_dir, motion_dir), hidraw_root)
     return Mouse(
         sysfs_dir=device_dir,
         vendor=VENDOR_ID,
@@ -393,7 +484,12 @@ def _mouse_from_device(device_dir: Path, root: Path, hidraw_root: Path) -> Mouse
         speed_mbps=speed_mbps,
         interface_dir=motion_dir,
         config_interface_dir=config_dir,
-        hidraw_path=hidraw_node_for((config_dir, motion_dir), hidraw_root),
+        hidraw_path=hidraw_path,
+        hidraw_descriptor=(
+            hidraw_root / hidraw_path.name / "device" / "report_descriptor"
+            if hidraw_path is not None
+            else None
+        ),
         endpoint=_mouse_endpoint(motion_dir, speed_mbps) if motion_dir is not None else None,
     )
 
@@ -663,6 +759,29 @@ class HidrawIO:
         return bytes(os.read(fd, HIDRAW_READ_BYTES)) if ready else None
 
     @staticmethod
+    def lock(fd: int, timeout_ms: int) -> bool:
+        """Exclusive advisory lock on the node; False if it stays taken.
+
+        hidraw gives every opener its own copy of every input report, so one
+        process cannot consume another's answer — measured: a reader running
+        beside the tool sees each reply too and the tool is unaffected. What the
+        copies do allow is two compxctl runs reading each other's frames, which
+        matters because the protocol carries no sequence number. The lock closes
+        that window between our own processes; it cannot speak for other
+        software, and it does not need to be cleaned up: the kernel drops it
+        when the descriptor closes, whatever happens to the process.
+        """
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(LOCK_POLL_MS / 1000.0)
+
+    @staticmethod
     def close(fd: int) -> None:
         os.close(fd)
 
@@ -693,6 +812,7 @@ class HidrawSession:
         self._io = io
         self._clock = clock
         self._fd: int | None = None
+        self._silent_reason: str | None = None
 
     @property
     def mouse(self) -> Mouse:
@@ -702,7 +822,14 @@ class HidrawSession:
         return self._mouse
 
     def __enter__(self) -> "HidrawSession":
-        path = require_hidraw_path(self.mouse)
+        mouse = self.mouse
+        path = require_hidraw_path(mouse)
+        descriptor = (
+            _read_bytes(mouse.hidraw_descriptor) if mouse.hidraw_descriptor is not None else b""
+        )
+        mistaken = interface_refusal(path, descriptor)
+        if mistaken is not None:
+            raise RuntimeError(mistaken)
         try:
             self._fd = self._io.open(path)
         except PermissionError as exc:
@@ -713,6 +840,14 @@ class HidrawSession:
             ) from exc
         except OSError as exc:
             raise RuntimeError(f"Cannot open {path}: {exc}") from exc
+        if not self._io.lock(self._fd, LOCK_WAIT_MS):
+            self._io.close(self._fd)
+            self._fd = None
+            raise RuntimeError(
+                f"Another compxctl is talking to the mouse: the lock on {path} is "
+                f"held and did not come free within {LOCK_WAIT_MS} ms. Try again in "
+                "a moment."
+            )
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -809,7 +944,17 @@ class HidrawSession:
         fresh one by its header alone, so the fewer commands in flight, the
         fewer chances to read the wrong answer.
         """
+        if self._silent_reason is not None:
+            # Nothing has answered in this session, and the remaining readouts
+            # of `status` would each pay the full retry budget to learn it again
+            # — fourteen seconds of a status bar waiting on a sleeping mouse.
+            raise RuntimeError(
+                f"The device stopped answering ({self._silent_reason}); skipping "
+                "the remaining questions. Is the mouse switched off or asleep?"
+            )
+
         detail = timeout_message
+        heard_something = False
         for _ in range(READ_ATTEMPTS):
             self._drain_pending()
             self.send(packet)
@@ -817,6 +962,14 @@ class HidrawSession:
             if reply is not None:
                 return parse(reply)
             detail = reason or timeout_message
+            heard_something = heard_something or reason is not None
+        if not heard_something:
+            self._silent_reason = f"no input report within {self.timeout_ms} ms, "                 f"{READ_ATTEMPTS} attempts in a row"
+            raise RuntimeError(
+                f"{timeout_message} — nothing came back at all. Is the mouse "
+                "switched off or asleep? (The rest of this command's readouts are "
+                "skipped.)"
+            )
         raise RuntimeError(
             f"{detail} (tried {READ_ATTEMPTS} times; is another program "
             "talking to the mouse?)"

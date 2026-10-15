@@ -75,6 +75,27 @@ interval packet (`09 11 …`) and for every config write (`09 07 …`, echoing t
 bytes that were written). All of it is filtered out by opcode, address and
 checksum instead of being mistaken for an answer.
 
+**The node is chosen by its report descriptor, not by interface number.** The
+descriptor is read from sysfs (world-readable) and parsed: the right node is the
+one that declares id `0x08` as a FEATURE report and `0x09` as INPUT. On the
+verified unit that is `hidraw1`; the motion interface (`hidraw0`) declares no
+vendor report at all, and a feature report sent there fails with `EPIPE`. If the
+descriptor cannot be read the tool does not guess: it falls back to the interface
+class and lets the reply check decide. If the descriptor *is* readable and
+contradicts, the command refuses to talk to that node at all — protection for the
+three product ids the code supports but nobody has verified, where the
+interfaces may be numbered differently while the reports they declare cannot lie.
+
+**Two runs do not trip over each other.** hidraw hands every opener its own copy
+of every input report (measured: a process reading the node alongside the tool
+saw all the replies, and the tool was unaffected). The flip side is that two
+compxctl instances can see each other's frames and the protocol has no sequence
+number, so the node is held under `flock` for the duration of a request: a second
+run waits up to two seconds and then says the node is busy. The kernel drops the
+lock when the descriptor closes or the process dies, so nothing goes stale. It
+does not constrain other software that opens the same node — it is a warning, not
+a fence.
+
 ## Install
 
 ```console
@@ -160,7 +181,12 @@ The stored code is `DPI / 50 - 1`; DPI must be a multiple of 50 in 50..6400.
 Every write is verified by reading **all four bytes** back.
 
 Slots 6 and 7 on the verified unit hold an undecoded extended encoding. They are
-listed as raw bytes and never overwritten. If the active-level register (0x0004)
+listed as raw bytes and never overwritten. Slot 6 holds `EF EF 00 77`, and `0xEF`
+is exactly `12000 / 50 - 1`, so the scale **may** simply continue past 6400; slot
+7 (`7B 7B 44 1B`) also carries an unknown `mul = 0x44` byte. That is a hypothesis,
+not a measurement: closing it needs a capture of the vendor utility while setting
+8000/12000/maximum, which we do not have. `dpi_decode` therefore leaves them
+undecoded — printing "12000" unverified would be inventing a number. If the active-level register (0x0004)
 does not hold a valid 1..8 index, `dpi N` refuses and asks for `--slot` instead
 of guessing — the previous version silently wrote slot 0 in that case.
 
@@ -205,10 +231,12 @@ What you can rely on:
   bump it.
 
 `status --json` does not touch the kernel driver and does not disturb the mouse,
-so a status bar can call it every second — while the device answers, that is a
-few milliseconds. A device that does not answer runs into the timeout on every
-read, and then `status` can take up to ~14 s (4 reads × 4 attempts × 500 ms),
-which is worth a timeout of your own in a bar.
+so a status bar can call it every second — while the device answers, that is a few
+milliseconds. If the mouse is switched off or asleep, the tool does not ask four
+times over: after the first run of timeouts (4 attempts × 500 ms) it marks the
+device as silent, skips the remaining reads and says so in `warnings`. That is
+~2 s instead of ~14, and the document honestly carries `null` where a value was
+never asked for.
 
 ## Permissions
 
@@ -265,7 +293,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-185 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+199 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:
@@ -315,6 +343,9 @@ All of the following was measured on an Ardor Gaming Ulta (`25a7:fa7b`), kernel
   the frame with the capture verified on hardware.
 * `rate host` cannot express "only this mouse" — `mousepoll` is global.
 * Slots 6-7 use an undecoded encoding and are never written.
+* The lock serializes `compxctl` runs only. Another program opening the same node
+  does not lose frames (every opener gets its own copies), but the mutual
+  visibility of foreign replies remains: the protocol carries no sequence number.
 * The port reset drops **the whole receiver** off the bus. If the same receiver
   also carries a keyboard, that keyboard disappears for a second — which is what
   `--no-reset` is for.

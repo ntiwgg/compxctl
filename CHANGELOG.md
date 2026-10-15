@@ -82,8 +82,24 @@ mismatch on a write that worked — never a silent wrong value — and
   host sees afterwards.
 - A test that reads this module's own AST and fails on any import outside the
   standard library, so "no dependencies" stays a checked property.
+- The hidraw node is now chosen by parsing its HID report descriptor: the right
+  node is the one declaring id `0x08` as a FEATURE report and `0x09` as INPUT. A
+  readable descriptor that contradicts is taken as proof of the wrong interface
+  and the command refuses to talk to that node, instead of sending a feature
+  report where it does not belong. This matters for the three product ids the
+  code supports but nobody has verified.
+- Concurrent runs are serialized with `flock` on the node. Measured first: hidraw
+  gives every opener its own copy of every input report, so nothing is stolen
+  from anyone — but two compxctl processes can each read the other's frames, and
+  the protocol has no sequence number to tell them apart.
+- A device that has gone quiet is asked once, not four times: after the first run
+  of timeouts the session marks the device silent, `status` skips the remaining
+  readouts and says so in `warnings`. A sleeping mouse now costs ~2 s instead of
+  ~14 s, which is what makes polling it from a status bar reasonable.
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
-  readback, the port reset, the JSON documents and the queue drain: 185 in total.
+  readback, the port reset, the report-descriptor walk (run against both
+  descriptors captured from the hardware), the lock and the JSON documents: 199
+  in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.

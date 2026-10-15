@@ -56,6 +56,8 @@ def make_sysfs_tree(
     b_interval: str = "01",
     endpoint_address: str = "81",
     hidraw_nodes: bool = True,
+    descriptors: bool = True,
+    swapped_descriptors: bool = False,
 ) -> Path:
     """A minimal stand-in for /sys/bus/usb/devices with one CompX mouse.
 
@@ -88,17 +90,30 @@ def make_sysfs_tree(
     _write(config_interface / "bInterfaceSubClass", "01")
     _write(config_interface / "bInterfaceProtocol", "01")
 
+    if descriptors:
+        # As on the verified unit: the motion interface declares no vendor
+        # reports, the config interface declares ids 6/8 as FEATURE and 9 as
+        # INPUT. `swapped_descriptors` puts them the other way round, which is
+        # how the check that the descriptor decides — and not the interface
+        # numbering — is tested.
+        motion_hid = mouse_interface / "0003:25A7:FA7B.0001"
+        config_hid = config_interface / "0003:25A7:FA7B.0002"
+        for directory, blob in (
+            (motion_hid, MOUSE_DESCRIPTOR),
+            (config_hid, CONFIG_DESCRIPTOR),
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "report_descriptor").write_bytes(blob)
+    else:
+        motion_hid = mouse_interface / "0003:25A7:FA7B.0001"
+        config_hid = config_interface / "0003:25A7:FA7B.0002"
+
     if hidraw_nodes:
         # The motion interface is the lower-numbered node, as it is on the
         # verified unit: the trap this tree exists to catch.
-        _link(
-            hidraw_root(root) / "hidraw0" / "device",
-            mouse_interface / "0003:25A7:FA7B.0001",
-        )
-        _link(
-            hidraw_root(root) / "hidraw1" / "device",
-            config_interface / "0003:25A7:FA7B.0002",
-        )
+        first, second = (config_hid, motion_hid) if swapped_descriptors else (motion_hid, config_hid)
+        _link(hidraw_root(root) / "hidraw0" / "device", first)
+        _link(hidraw_root(root) / "hidraw1" / "device", second)
 
     other = devices / "1-1"
     _write(other / "idVendor", "1234")
@@ -118,6 +133,29 @@ def hidraw_root(root: Path) -> Path:
 def find_mouse(root: Path) -> compxctl.Mouse:
     return compxctl.find_mouses(make_sysfs_tree(root), hidraw_root(root))[0]
 
+
+# ==========================================================================
+# HID report descriptors captured from the verified unit
+# ==========================================================================
+
+# The config interface (3-2:1.1 -> /dev/hidraw1): declares report id 8 as a
+# FEATURE report and id 9 as INPUT, which is the whole protocol.
+CONFIG_DESCRIPTOR = bytes.fromhex(
+    "05010906a1018501050719e029e715002501750195088102050719002aff0095"
+    "067508150026ff008100c00603ff0900a10185020900150026ff007508950781"
+    "02c0050c0901a10185051500263c0219002a3c02751095018100c005010980a1"
+    "0185031981298315002501950375018102950175058101c00601ff0900a10185"
+    "09090095107508150026ff008102c00604ff0902a10185060902150026ff0075"
+    "089507b102c00602ff0902a10185080902150026ff0075089510b102c0"
+)
+
+# The motion interface (3-2:1.0 -> /dev/hidraw0): no report ids to speak of,
+# which is why a feature report sent there fails with EPIPE.
+MOUSE_DESCRIPTOR = bytes.fromhex(
+    "05010902a1010901a10005091901290515002501950575018102950175038101"
+    "05010930093116008026ff7f751095028106c0a100050109381581257f750895"
+    "018106c0a100050c0a3802950175081581257f8106c0c0"
+)
 
 # ==========================================================================
 # Zero dependencies
@@ -317,6 +355,75 @@ def test_require_hidraw_path_explains_a_missing_node(tmp_path: Path) -> None:
     )[0]
     with pytest.raises(RuntimeError, match="has no /dev/hidraw node"):
         compxctl.require_hidraw_path(mouse)
+
+
+def test_report_ids_reads_the_descriptor_of_the_verified_unit() -> None:
+    """The two descriptors captured from the hardware, decoded.
+
+    The config interface is the one that declares id 8 as a FEATURE report and
+    id 9 as INPUT; the motion interface declares neither, which is why a feature
+    report sent to it comes back as EPIPE.
+    """
+    config = compxctl.report_ids(CONFIG_DESCRIPTOR)
+    assert config["feature"] == {0x06, 0x08}
+    assert config["input"] == {0x01, 0x02, 0x03, 0x05, 0x09}
+    assert compxctl.declares_vendor_reports(CONFIG_DESCRIPTOR) is True
+
+    mouse = compxctl.report_ids(MOUSE_DESCRIPTOR)
+    assert mouse["feature"] == set()
+    assert compxctl.declares_vendor_reports(MOUSE_DESCRIPTOR) is False
+
+
+def test_report_ids_skips_long_items() -> None:
+    """A long item carries its own length; mis-reading it desynchronizes the walk."""
+    descriptor = bytes(
+        [0x06, 0x00, 0xFF]  # Usage Page (Vendor)
+        + [0xFE, 0x03, 0x01, 0xAA, 0xBB, 0xCC]  # long item, 3 bytes of payload
+        + [0x85, 0x08, 0x09, 0x00, 0xB1, 0x02]  # Report ID 8, Feature, 2 bytes
+    )
+    assert compxctl.report_ids(descriptor)["feature"] == {0x08}
+
+
+def test_report_ids_survives_a_truncated_descriptor() -> None:
+    """A cut-off descriptor is data from sysfs, not a promise."""
+    assert compxctl.report_ids(b"") == {"input": set(), "output": set(), "feature": set()}
+    assert compxctl.report_ids(bytes([0x85]))["feature"] == set()
+    assert compxctl.report_ids(CONFIG_DESCRIPTOR[:40])["feature"] == set()
+    assert compxctl.report_ids(bytes([0xFE, 0x10]))["feature"] == set()
+
+
+def test_interface_refusal_stops_at_the_wrong_interface() -> None:
+    node = Path("/dev/hidraw0")
+    refusal = compxctl.interface_refusal(node, MOUSE_DESCRIPTOR)
+    assert refusal is not None
+    assert "not the vendor config interface" in refusal
+    assert "0x08" in refusal
+
+
+def test_interface_refusal_is_silent_for_the_right_interface_and_for_nothing() -> None:
+    assert compxctl.interface_refusal(Path("/dev/hidraw1"), CONFIG_DESCRIPTOR) is None
+    # An unreadable descriptor is not evidence: the protocol decides instead.
+    assert compxctl.interface_refusal(Path("/dev/hidraw1"), b"") is None
+
+
+def test_hidraw_node_is_chosen_by_the_descriptor_when_it_disagrees(tmp_path: Path) -> None:
+    """The descriptor decides, not the interface numbering.
+
+    On an unverified sibling model the interfaces may be numbered differently;
+    the reports an interface declares cannot lie about what it is.
+    """
+    root = make_sysfs_tree(tmp_path, swapped_descriptors=True)
+    mouse = compxctl.find_mouses(root, hidraw_root(tmp_path))[0]
+    assert mouse.hidraw_path == Path("/dev/hidraw0")
+    assert mouse.hidraw_descriptor == hidraw_root(tmp_path) / "hidraw0" / "device" / "report_descriptor"
+
+
+def test_hidraw_node_falls_back_to_the_interface_class_without_descriptors(
+    tmp_path: Path,
+) -> None:
+    root = make_sysfs_tree(tmp_path, descriptors=False)
+    mouse = compxctl.find_mouses(root, hidraw_root(tmp_path))[0]
+    assert mouse.hidraw_path == Path("/dev/hidraw1")
 
 
 def test_mousepoll_round_trip(tmp_path: Path) -> None:
@@ -560,14 +667,22 @@ class FakeHidrawIO:
     a frame queued by hand models traffic that was already on the wire.
     """
 
-    def __init__(self, responses: list[bytes | None] | None = None) -> None:
+    def __init__(
+        self, responses: list[bytes | None] | None = None, *, lock_available: bool = True
+    ) -> None:
         self.sent: list[bytes] = []
         self.queue: list[bytes] = []
         self.responses = list(responses or [])
         self.opened: list[Path] = []
         self.closed: list[int] = []
         self.timeouts: list[int] = []
+        self.locks: list[tuple[int, int]] = []
+        self.lock_available = lock_available
         self.fail_send: OSError | None = None
+
+    def lock(self, fd: int, timeout_ms: int) -> bool:
+        self.locks.append((fd, timeout_ms))
+        return self.lock_available
 
     def open(self, path: Path) -> int:
         self.opened.append(path)
@@ -650,6 +765,60 @@ def test_session_opens_the_config_interface_node(tmp_path: Path) -> None:
     assert io.closed == [3]
 
 
+def test_session_takes_an_advisory_lock(tmp_path: Path) -> None:
+    """Two compxctl runs are serialized: each sees every report, so they may not
+    overlap or one can read the other's frame."""
+    io = FakeHidrawIO()
+    with make_session(io, tmp_path):
+        pass
+    assert io.locks == [(3, compxctl.LOCK_WAIT_MS)]
+
+
+def test_session_reports_a_lock_held_by_another_process(tmp_path: Path) -> None:
+    io = FakeHidrawIO(lock_available=False)
+    with pytest.raises(RuntimeError, match="Another compxctl"):
+        with make_session(io, tmp_path):
+            pass
+    assert io.closed == [3]  # the node is not left open on the way out
+
+
+def test_session_refuses_a_node_that_is_not_the_vendor_interface(tmp_path: Path) -> None:
+    """Only the motion interface has a node: better to stop than to poke it."""
+    root = make_sysfs_tree(tmp_path)
+    shutil.rmtree(hidraw_root(tmp_path) / "hidraw1")
+    mouse = compxctl.find_mouses(root, hidraw_root(tmp_path))[0]
+    assert mouse.hidraw_path == Path("/dev/hidraw0")
+    with pytest.raises(RuntimeError, match="not the vendor config interface"):
+        with compxctl.HidrawSession(mouse, io=FakeHidrawIO()):
+            pass
+
+
+def test_session_stops_asking_once_the_device_has_gone_quiet(tmp_path: Path) -> None:
+    """A sleeping mouse costs one retry budget, not one per readout.
+
+    `status` asks four questions; paying four full timeouts for the same silence
+    is fourteen seconds of a status bar waiting on a mouse that is switched off.
+    """
+    io = FakeHidrawIO([None] * compxctl.READ_ATTEMPTS)
+    with make_session(io, tmp_path) as session:
+        with pytest.raises(RuntimeError, match="nothing came back at all"):
+            session.read(0x0000, 2)
+        sent_for_the_first = len(io.sent)
+        with pytest.raises(RuntimeError, match="stopped answering"):
+            session.read(0x0004, 2)
+        assert len(io.sent) == sent_for_the_first  # the second read sent nothing
+
+
+def test_a_wrong_reply_is_not_silence(tmp_path: Path) -> None:
+    """Frames arriving but not matching is a different problem: keep asking."""
+    io = FakeHidrawIO([_read_reply(0x0004, b"\x01\x54")] * compxctl.READ_ATTEMPTS)
+    with make_session(io, tmp_path) as session:
+        with pytest.raises(RuntimeError, match="header mismatch"):
+            session.read(0x0000, 2)
+        io.responses.extend([_read_reply(0x0000, b"\x01\x54")])
+        assert session.read(0x0000, 2) == b"\x01\x54"
+
+
 def test_session_read_returns_payload(tmp_path: Path) -> None:
     io = FakeHidrawIO([_read_reply(0x0000, b"\x01\x54")])
     with make_session(io, tmp_path) as session:
@@ -719,11 +888,20 @@ def test_await_reply_gives_up_when_the_deadline_passes(tmp_path: Path) -> None:
 
 
 def test_session_read_gives_up_after_read_attempts(tmp_path: Path) -> None:
+    """Silence is named as silence: the caller knows the device is not there."""
     io = FakeHidrawIO([None] * compxctl.READ_ATTEMPTS)
     with make_session(io, tmp_path) as session:
-        with pytest.raises(RuntimeError, match="tried"):
+        with pytest.raises(RuntimeError, match="nothing came back at all"):
             session.read(0x0000, 2)
     assert len(io.sent) == compxctl.READ_ATTEMPTS
+
+
+def test_session_read_blames_the_other_program_when_frames_do_come(tmp_path: Path) -> None:
+    """Frames arriving and never matching means someone else is talking."""
+    io = FakeHidrawIO([_read_reply(0x0004, b"\x01\x54")] * compxctl.READ_ATTEMPTS)
+    with make_session(io, tmp_path) as session:
+        with pytest.raises(RuntimeError, match="tried 4 times"):
+            session.read(0x0000, 2)
 
 
 def test_session_read_reports_a_wrong_reply(tmp_path: Path) -> None:
@@ -1518,13 +1696,17 @@ def test_battery_json_on_stdout(monkeypatch, capsys, tmp_path: Path) -> None:
 
 
 def test_status_json_reports_what_failed_instead_of_dying(monkeypatch, capsys, tmp_path: Path) -> None:
-    """A status bar needs a document even when one readout fails."""
+    """A status bar needs a document even when one readout fails.
+
+    The failing readout answers with the wrong register, so the session knows
+    frames are arriving and keeps asking: the battery is still read.
+    """
     _mouse_for(monkeypatch, tmp_path)
     io = FakeHidrawIO(
         [
             _read_reply(0x0000, bytes((0x01,))),  # stored rate: a one-byte read
             _read_reply(0x0004, bytes((0x01, 0x54))),  # active DPI level
-            None, None, None, None,                    # DPI slots fail
+            *[_read_reply(0x0008, bytes((0x00, 0x00, 0x00, 0x00)))] * compxctl.READ_ATTEMPTS,
             _reply(b"\x09\x04\x00\x00\x00", b"\x02\x64\x00"),  # battery still answered
         ]
     )
@@ -1539,6 +1721,32 @@ def test_status_json_reports_what_failed_instead_of_dying(monkeypatch, capsys, t
     assert doc["battery"]["percent"] == 100
     assert doc["warnings"] and "DPI slots" in doc["warnings"][0]
     assert captured.err == ""  # warnings belong in the document
+
+
+def test_status_json_skips_the_rest_of_a_silent_device(monkeypatch, capsys, tmp_path: Path) -> None:
+    """A mouse that is switched off costs one retry budget, not four.
+
+    Everything after the first silent readout is skipped and said so, which is
+    what keeps `status --json` usable in a status bar when the mouse is asleep.
+    """
+    _mouse_for(monkeypatch, tmp_path)
+    io = FakeHidrawIO(
+        [
+            _read_reply(0x0000, bytes((0x01,))),  # stored rate
+            _read_reply(0x0004, bytes((0x01, 0x54))),  # active DPI level
+            *([None] * compxctl.READ_ATTEMPTS),  # the device goes quiet here
+        ]
+    )
+    monkeypatch.setattr(compxctl, "read_mousepoll", lambda path=None: 0)
+    monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
+    assert compxctl.main(["status", "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["stored_rate_hz"] == 1000
+    assert doc["dpi_slots"] == []
+    assert doc["battery"] is None  # never asked: the device had stopped answering
+    assert any("stopped answering" in warning for warning in doc["warnings"])
+    # Four attempts for the silent readout, and nothing sent after it.
+    assert len(io.sent) == 2 + compxctl.READ_ATTEMPTS
 
 
 def test_status_text_warns_on_stderr(monkeypatch, capsys, tmp_path: Path) -> None:
