@@ -161,8 +161,7 @@ meant to make the host re-read the descriptor, but the descriptor does not follo
 the stored code — `bInterval` stays `01` with either code, on both sides of a
 reset the kernel logged as real. Its price was real: a second udev rule granting
 access to the *whole* USB device node, and a second during which the entire
-receiver leaves the bus — keyboard included, if one shares it. The rate is changed
-by the live packets, and they go out either way. When the re-enumeration is
+receiver leaves the bus — keyboard included, if one shares it. When the re-enumeration is
 actually wanted (say, to see what the host reports), ask for it:
 
 ```console
@@ -174,14 +173,27 @@ Device EEPROM updated to 500 Hz (0x02).
 
 It refuses to run without `--persist`; `--reset-port` additionally re-enumerates.
 When the stored value already matches, the EEPROM is not written and the port is
-left alone. The live packets still go out,
-and that is not redundancy: they set the rate **now**, while the EEPROM holds the
-one the mouse boots with. The two states are independent — another program may
-have changed the live rate, or an earlier run may have stopped between the
-packets and the write. `--no-reset` leaves the reset to
-you: it writes the value and still reminds you to re-plug, which is what you
-want if the receiver is shared with a keyboard and you would rather it did not
-disappear.
+left alone.
+
+> **What is verified here, and what is not.** The EEPROM write is verified by
+> reading it back — that is measured. An *observable effect* of it, or of the live
+> interval packets, could not be found on the verified unit:
+>
+> * the descriptor does not follow the stored code: `bInterval` stays `01` with
+>   `0x01` or `0x02` stored;
+> * the live packets do not change what the host receives. With `live = 500` and
+>   `live = 1000` reports arrive at the same ~1 ms cadence, and every report that
+>   carries a delta is followed by another one that does: 0% repeats after a
+>   movement across roughly 15 000 pairs. A 500 Hz device behind a 1 ms host poll
+>   would repeat every second report, and it does not.
+>
+> So **`rate host` is the path with a measurable effect**, while `rate device
+> --persist` writes a value into the mouse (verified by readback) in the hope that
+> it matters after the mouse is switched off. That last part is **not** verified:
+> it needs a power cycle of the mouse, which was not done. There is also what
+> cannot be seen from outside — if the dongle interpolates movement, the device's
+> internal sampling rate could change while the report stream stays the same, and
+> telling that apart needs an independent source of motion.
 
 The reset is `USBDEVFS_RESET` on `/dev/bus/usb/BBB/DDD`; the kernel logs it
 (`usb 3-2: reset full-speed USB device number 2`), so it is easy to check. If
@@ -193,8 +205,10 @@ Which one do you want?
 * **"I want 1000 Hz in Linux right now"** → `rate host 1000`. Nothing is
   written to the mouse.
 * **"The setting should travel with the mouse"** → `rate device 1000 --persist`.
-* **"I want 125/500 Hz"** → prefer the device path. Forcing the host down to
-  8 ms slows *all* your mice, including a 1000 Hz one.
+* **"I want 125/500 Hz"** → `rate host` slows *all* your mice, including a
+  1000 Hz one, but its effect is measurable. `rate device` writes the value into
+  the mouse itself and verifies the write by reading it back, yet its effect could
+  not be observed on this model (see the box above).
 
 ### DPI
 
@@ -388,8 +402,16 @@ All of the following was measured on an Ardor Gaming Ulta (`25a7:fa7b`), kernel
   it is the same. Checked on both sides of a port reset. So the old wording
   ("re-plug the mouse so the host re-reads the descriptor") explained the effect
   wrongly: nothing in the descriptor changes, and the stored code governs how
-  often the mouse itself sends. That last step is an inference — seeing it
-  directly would mean counting input reports while the mouse moves.
+  often the mouse itself sends — refuted below.
+* **The live packets do not change the report stream.** Measured with a counter on
+  the input reports (one report is one poll, unlike the removed `check`, which
+  counted evdev events): with `live = 500` and `live = 1000` reports arrive at the
+  same ~1 ms cadence, and every report carrying a delta is followed by another
+  that does — 0% repeats after a movement across roughly 15 000 pairs. A mouse
+  sampling at 500 Hz behind a 1 ms host poll would repeat every second report, and
+  it does not. What happens to the sampling rate inside the mouse is invisible
+  from outside: a dongle that interpolates movement would keep the stream the
+  same.
 * **A full config-memory dump taken before and after all of it is identical** —
   the writes never touched the DPI level count (`0x0002`), the active index
   (`0x0004`) or the slots.

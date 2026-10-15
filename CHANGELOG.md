@@ -7,17 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.0.0] — 2026-10-15
 
+### Documented after measuring
+- The live interval packets are sent, and on the verified unit they change nothing
+  observable. With the live code at 500 Hz the host still receives a fresh report
+  every ~1 ms: across four windows and roughly 15 000 movement-to-movement pairs,
+  0% were repeats, where a 500 Hz device behind a 1 ms host poll would repeat
+  every second report. So `rate host` is the path with a measurable effect, while
+  `rate device --persist` is verified as a *write* (readback) and not as a change
+  anyone can see; what the stored value does after the mouse is switched off
+  remains untested, because that needs a power cycle of the mouse. Both READMEs
+  say this now, in place of the earlier claim that the live packets set the
+  current rate.
+- This is also why `rate device HZ` without `--persist` was **not** changed to
+  send only the live packets: the idea was a temporary rate change without EEPROM
+  wear, and the measurement says there is no temporary rate change to offer.
+
 ### Changed
 - **Breaking:** `rate device HZ --persist` no longer resets the port. The reset
   existed to make the host re-read the descriptor, and the measurement says the
   descriptor does not follow the stored interval: `bInterval` stays `01` with
   either code stored, on both sides of a reset the kernel logged as real. What it
   cost was a second udev rule granting access to the whole USB device node, and a
-  second with the entire receiver — keyboard included — off the bus. The rate is
-  changed by the live interval packets, which are sent either way; the stored code
-  is what the mouse boots with. `--reset-port` asks for the re-enumeration when
-  someone wants it (verified: the kernel's reset counter stays put without the
-  flag and goes up by one with it).
+  second with the entire receiver — keyboard included — off the bus. `--reset-port`
+  asks for the re-enumeration when someone wants it (verified: the kernel's reset
+  counter stays put without the flag and goes up by one with it).
 - **Breaking:** `--no-reset` is gone, because it asked for what is now the
   default. Anyone passing it gets a usage error rather than a silent surprise.
 - The udev `usb_device` rule is now optional: only `--reset-port` needs it, so a
