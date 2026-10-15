@@ -2064,7 +2064,7 @@ def tui_slot(index: int, dpi: int | None) -> dict:
     }
 
 
-def tui_document(*, slot_zero_dpi: int = 400, active_slot: int = 0) -> dict:
+def tui_document(*, slot_zero_dpi: int = 400, active_slot: int = 5) -> dict:
     """The document `status --json` prints, as the screen receives it."""
     rows = [tui_slot(0, slot_zero_dpi)]
     rows += [tui_slot(index, 50 * (index + 1)) for index in range(1, 6)]
@@ -2099,6 +2099,10 @@ class FakeWriteSession:
 
     def dpi_slot(self, slot: int) -> dict:
         return tui_slot(slot, self.held.get(slot))
+
+    def active_dpi_level(self) -> tuple[int, int]:
+        """Level 5, so that the slots the tests write are not the active one."""
+        return (6, 0x55 - 6)
 
     def write_dpi(self, slot: int, code: int) -> None:
         self.writes.append((slot, code))
@@ -2137,10 +2141,12 @@ def test_tui_step_stays_inside_what_the_protocol_encodes(start: int, delta: int,
     assert compxctl.tui_step(start, delta) == expected
 
 
-def test_tui_only_slots_zero_to_five_are_editable() -> None:
+def test_tui_only_inactive_decoded_slots_are_editable() -> None:
+    """Slots 6 and 7 are undecoded, and the active level belongs to the mouse:
+    it mirrors its RAM value back into that slot within seconds."""
     slots = tui_document()["dpi_slots"]
-    assert [compxctl.tui_editable(slot) for slot in slots] == [True] * 6 + [False] * 2
-    assert sorted(compxctl.tui_pending(tui_document())) == [0, 1, 2, 3, 4, 5]
+    assert [compxctl.tui_editable(slot) for slot in slots] == [True] * 5 + [False] * 3
+    assert sorted(compxctl.tui_pending(tui_document())) == [0, 1, 2, 3, 4]
 
 
 def test_tui_refuses_a_terminal_that_cannot_address_the_cursor(monkeypatch) -> None:
@@ -2181,7 +2187,7 @@ def test_tui_handle_moves_selection_and_never_past_the_last_editable_slot() -> N
     selection = 0
     for _ in range(20):
         selection, pending = compxctl.tui_handle(FakeCurses.KEY_DOWN, selection, pending)
-    assert selection == 5  # not 6 or 7: they are read-only
+    assert selection == 4  # not 5 (the active level), nor 6 and 7
     for _ in range(20):
         selection, pending = compxctl.tui_handle(FakeCurses.KEY_UP, selection, pending)
     assert selection == 0
@@ -2196,6 +2202,41 @@ def test_tui_handle_steps_the_selected_slot_only(monkeypatch) -> None:
     assert pending[1] == 500
     _, pending = compxctl.tui_handle(ord("["), 1, pending)
     assert pending[1] == 100
+
+
+def test_the_active_level_cannot_be_written(tmp_path: Path) -> None:
+    """Measured: the mouse mirrors its RAM value back into the active level's slot
+    within seconds, so a write there is undone by the device. Reporting success
+    would be reporting a value that no longer exists."""
+    io = FakeHidrawIO([_read_reply(0x0004, bytes((0x01, 0x54)))])  # level 1: slot 0
+    with make_session(io, tmp_path) as session:
+        with pytest.raises(RuntimeError, match="undone by the device"):
+            compxctl.apply_dpi_slot(session, 0, 800)
+        # nothing was written: no slot read, no write frame
+        assert all(frame[1] == 0x08 for frame in io.sent)
+
+
+def test_the_active_level_is_found_from_the_register(tmp_path: Path) -> None:
+    io = FakeHidrawIO([_read_reply(0x0004, bytes((0x03, 0x52)))])  # level 3 -> slot 2
+    with make_session(io, tmp_path) as session:
+        assert compxctl.active_level_slot(session) == 2
+
+
+def test_dpi_without_a_slot_refuses_the_active_level(monkeypatch, capsys, tmp_path: Path) -> None:
+    """`compxctl dpi N` means "the level I am on", which is the one the device owns."""
+    _mouse_for(monkeypatch, tmp_path)
+    # Two replies: the level is read once to resolve the default slot, and once
+    # more by the guard in apply_dpi_slot, which is the single place that decides.
+    io = FakeHidrawIO(
+        [
+            _read_reply(0x0004, bytes((0x02, 0x53))),  # level 2: slot 1
+            _read_reply(0x0004, bytes((0x02, 0x53))),
+        ]
+    )
+    monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
+    assert compxctl.main(["dpi", "1600"]) == 1
+    err = capsys.readouterr().err
+    assert "undone by the device" in err and "DPI button" in err
 
 
 def test_run_tui_edits_and_writes_the_selected_slot(monkeypatch) -> None:
@@ -2279,8 +2320,9 @@ def test_run_tui_draws_every_slot_and_the_read_only_note(monkeypatch) -> None:
     compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"]))
     text = screen.text()
     assert "Слот 0" in text and "Слот 7" in text
-    assert text.count("[только чтение]") == 2  # slots 6 and 7
-    assert "[АКТИВЕН]" in text
+    # slots 6, 7 and the active level (5 in this fixture)
+    assert text.count("[только чтение]") == 3
+    assert "АКТИВЕН — мышь перезапишет" in text
 
 
 # ==========================================================================
@@ -2389,6 +2431,7 @@ def test_dpi_write_json_reports_the_previous_value(monkeypatch, capsys, tmp_path
     _mouse_for(monkeypatch, tmp_path)
     io = FakeHidrawIO(
         [
+            _read_reply(0x0004, bytes((0x05, 0x50))),  # the level the mouse is on: slot 4
             _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),  # the slot as it is
             None,  # the write itself
             _write_ack(0x000C, bytes((0x13, 0x13, 0x00, 0x2F))),
@@ -2410,18 +2453,31 @@ def test_dpi_write_is_skipped_when_the_slot_already_holds_it(
 ) -> None:
     """A config-memory write nobody asked for is wear on an unknown budget."""
     _mouse_for(monkeypatch, tmp_path)
-    io = FakeHidrawIO([_read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47)))])
+    io = FakeHidrawIO(
+        [
+            _read_reply(0x0004, bytes((0x05, 0x50))),  # the level the mouse is on: slot 4
+            _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),
+        ]
+    )
     monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
     assert compxctl.main(["dpi", "--slot", "0", "400"]) == 0
     out = capsys.readouterr().out
     assert "already set" in out and "nothing written" in out
-    # one read of the slot, and nothing else on the wire
-    assert io.sent == [compxctl.build_read_frame(0x000C, 4)]
+    # the level, the slot, and nothing else on the wire
+    assert io.sent == [
+        compxctl.build_read_frame(0x0004, 2),
+        compxctl.build_read_frame(0x000C, 4),
+    ]
 
 
 def test_dpi_write_reports_an_unchanged_slot_in_json(monkeypatch, capsys, tmp_path: Path) -> None:
     _mouse_for(monkeypatch, tmp_path)
-    io = FakeHidrawIO([_read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47)))])
+    io = FakeHidrawIO(
+        [
+            _read_reply(0x0004, bytes((0x05, 0x50))),  # the level the mouse is on: slot 4
+            _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),
+        ]
+    )
     monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
     assert compxctl.main(["dpi", "--slot", "0", "400", "--json"]) == 0
     doc = json.loads(capsys.readouterr().out)
@@ -2436,6 +2492,7 @@ def test_dpi_write_still_writes_when_only_the_checksum_byte_differs(
     _mouse_for(monkeypatch, tmp_path)
     io = FakeHidrawIO(
         [
+            _read_reply(0x0004, bytes((0x05, 0x50))),  # the level the mouse is on: slot 4
             _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x00))),  # right code, bad crc
             None,
             _write_ack(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),

@@ -1849,6 +1849,16 @@ def _attempt(warnings: list[str], label: str, reader: Callable[[], ResultT]) -> 
         return None
 
 
+def active_level_slot(session: HidrawSession) -> int | None:
+    """The slot whose value the mouse is currently using, or None if unclear.
+
+    Named so that it cannot be confused with the local `active_slot` the DPI
+    listing keeps for `slot_json`, which is the same number under a shorter name.
+    """
+    active = session.active_dpi_level()
+    return active_slot_for_index(active[0]) if active else None
+
+
 def apply_dpi_slot(session: HidrawSession, slot: int, dpi: int) -> tuple[bool, dict]:
     """Write one DPI slot the way `dpi --slot S N` does. (changed, before).
 
@@ -1856,12 +1866,26 @@ def apply_dpi_slot(session: HidrawSession, slot: int, dpi: int) -> tuple[bool, d
     interactive screen alike: read the target slot, skip the write when those
     four bytes are already there, and let `write_dpi` verify the readback when
     they are not.
+
+    The active level is refused, and that is a measurement rather than a policy:
+    the mouse keeps the DPI it is using in RAM and writes that value back into
+    the active level's slot. A write there was read back as correct and was gone
+    five to ten seconds later, three times out of three — so reporting success
+    would be reporting a value the device has already discarded. Levels the mouse
+    is not on are not touched by it, and those writes hold.
     """
     code = dpi_code(dpi)
     if code is None:
         raise RuntimeError("DPI must be a multiple of 50 between 50 and 6400")
     if not 0 <= slot <= DPI_WRITE_SLOT_MAX:
         raise RuntimeError(f"slot must be 0..{DPI_WRITE_SLOT_MAX}")
+    if active_level_slot(session) == slot:
+        raise RuntimeError(
+            f"slot {slot} is the level the mouse is using right now, and the mouse "
+            "keeps that value in RAM and writes it back over the slot within seconds "
+            "— a write here is undone by the device, not by this tool. Change the "
+            "level with the DPI button on the mouse, or write a level you are not on."
+        )
     before = session.dpi_slot(slot)
     changed = slot_bytes(before) != dpi_payload(code)
     if changed:
@@ -1899,8 +1923,7 @@ def cmd_dpi(args: argparse.Namespace) -> int:
         if slot_arg is not None:
             slot = slot_arg
         else:
-            active = session.active_dpi_level()
-            slot = active_slot_for_index(active[0]) if active else None
+            slot = active_level_slot(session)
             if slot is None:
                 raise RuntimeError(
                     "The active DPI level in register 0x0004 is not a valid "
@@ -2071,9 +2094,15 @@ def tui_editable(slot: dict) -> bool:
     """Whether a slot may be written at all.
 
     Slots 0..5 carry a decoded DPI; 6 and 7 carry an extended encoding nobody has
-    worked out, and the tool has always refused to guess there.
+    worked out, and the tool has always refused to guess there. The active level
+    is not writable either: the mouse mirrors its RAM value back into that slot
+    within seconds, so the screen must not offer what the device undoes.
     """
-    return slot.get("dpi") is not None and slot["index"] < TUI_EDITABLE_SLOTS
+    return (
+        slot.get("dpi") is not None
+        and slot["index"] < TUI_EDITABLE_SLOTS
+        and not slot.get("active")
+    )
 
 
 def tui_step(dpi: int, delta: int) -> int:
@@ -2174,7 +2203,7 @@ def tui_draw(
         changed = proposed is not None and proposed != slot["dpi"]
         marks = "".join(
             (
-                " [АКТИВЕН]" if slot.get("active") else "",
+                " [АКТИВЕН — мышь перезапишет]" if slot.get("active") else "",
                 "" if tui_editable(slot) else " [только чтение]",
                 " * не записано" if changed else "",
             )
@@ -2218,9 +2247,11 @@ def tui_handle(key: int, selection: int, pending: dict[int, int]) -> tuple[int, 
     """Apply one keypress to the proposal. (new selection, new proposal)."""
     curses = _curses()
     if key in (curses.KEY_UP, ord("k")):
-        return max(0, selection - 1), pending
+        return max(min(pending, default=0), selection - 1), pending
     if key in (curses.KEY_DOWN, ord("j")):
-        return min(len(pending) - 1 if pending else 0, selection + 1), pending
+        # Down stops at the last writable slot, which is not len(pending) - 1:
+        # the active level and the undecoded slots are skipped over, not counted.
+        return min(max(pending, default=0), selection + 1), pending
     step = {
         curses.KEY_LEFT: -TUI_DPI_FINE,
         curses.KEY_RIGHT: TUI_DPI_FINE,
@@ -2263,7 +2294,17 @@ def run_tui(screen, args: argparse.Namespace) -> int:
             continue
         if key in (curses.KEY_ENTER, 10, 13):
             if selection not in pending:
-                message = f"Слот {selection} только для чтения — писать в него нельзя"
+                # No session here: the state on screen already says why the slot
+                # cannot be written, and a message must not cost a radio round-trip.
+                on_screen = next(
+                    (slot for slot in state.get("dpi_slots", []) if slot["index"] == selection),
+                    None,
+                )
+                message = (
+                    f"Слот {selection} — активный уровень, мышь вернёт своё значение"
+                    if on_screen and on_screen.get("active")
+                    else f"Слот {selection} только для чтения: кодировка не расшифрована"
+                )
                 continue
             try:
                 with session_for(args) as session:

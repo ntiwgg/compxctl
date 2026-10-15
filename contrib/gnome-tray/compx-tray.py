@@ -48,8 +48,6 @@ TIMEOUT_MS = 150  # an awake mouse answers in single-digit milliseconds
 RUN_TIMEOUT = 10  # a subprocess may never outlive its usefulness
 BADGE_PX = 44  # drawn large and scaled down by the shell: crisper on HiDPI
 ICON_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "compx-tray"
-PRESETS = (400, 800, 1600, 2400)
-
 # A panel has no terminal of its own, so the full-screen view needs one.
 TERMINALS = (
     ("ptyxis", "--"),
@@ -107,6 +105,10 @@ def describe(document: dict) -> dict:
         "stored": document.get("stored_rate_hz"),
         "asleep": percent is None,
         "error": error,
+        "ladder": [
+            f"{'*' if slot.get('active') else ' '} {slot['index']}: {slot.get('text', '?')}"
+            for slot in (document.get("dpi_slots") or [])
+        ],
     }
 
 
@@ -244,17 +246,15 @@ class Tray:
             menu.append(item)
         menu.append(Gtk.SeparatorMenuItem())
 
-        current = self.facts["dpi"]
-        group: list[Gtk.RadioMenuItem] = []
-        for value in PRESETS:
-            item = Gtk.RadioMenuItem(label=f"{value} DPI", group=group[0] if group else None)
-            item.set_active(value == current)
-            item.connect("activate", self.on_preset, value)
-            group.append(item)
-            menu.append(item)
-        if current is not None and current not in PRESETS:
-            item = Gtk.RadioMenuItem(label=f"{current} DPI (сейчас)", group=group[0])
-            item.set_active(True)
+        # The stored ladder, read-only. There used to be DPI presets here, and they
+        # were a mistake worth naming: a click wrote a value into the level the mouse
+        # was on, and the device mirrors its RAM value back over that slot within
+        # seconds — so the click changed nothing, or worse, it overwrote a level the
+        # user was not looking at. Editing lives in the screen, which asks for the
+        # level explicitly and refuses the one the device owns.
+        for line in self.facts["ladder"]:
+            item = Gtk.MenuItem(label=line)
+            item.set_sensitive(False)
             menu.append(item)
 
         menu.append(Gtk.SeparatorMenuItem())
@@ -270,10 +270,6 @@ class Tray:
         menu.append(quit_item)
         menu.show_all()
         return menu
-
-    def on_preset(self, _item: Gtk.RadioMenuItem, value: int) -> None:
-        run_tool("dpi", str(value))
-        self.refresh()
 
     def on_screen(self, _item: Gtk.MenuItem) -> None:
         command = terminal_command([TOOL, "tui"])
