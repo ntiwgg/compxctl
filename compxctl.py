@@ -40,6 +40,7 @@ they were verified on hardware; the framing is unchanged.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -593,8 +594,6 @@ READ_TIMEOUT_MS = 500
 DEVICE_INTERVAL_CODE_BY_RATE: dict[int, int] = {125: 0x08, 500: 0x02, 1000: 0x01}
 RATE_BY_DEVICE_INTERVAL_CODE: dict[int, int] = {0x08: 125, 0x04: 250, 0x02: 500, 0x01: 1000}
 
-RATE_BY_CODE: dict[int, int] = {0x00: 125, 0x01: 500, 0x02: 1000}
-
 # The two live packets per rate, then the EEPROM persistence packet. Bytes
 # verified against captures from a real mouse.
 LIVE_PACKETS: dict[int, tuple[bytes, ...]] = {
@@ -719,6 +718,30 @@ def dpi_decode(code: int, mul: int = 0) -> int | None:
     return (code + 1) * 50
 
 
+def dpi_payload(code: int) -> bytes:
+    """The four bytes a DPI slot holds for `code` (checksum included)."""
+    return bytes((code, code, 0x00, (0x55 - 2 * code) & 0xFF))
+
+
+def slot_dict(index: int, addr: int, x: int, y: int, mul: int, crc: int) -> dict:
+    """One DPI slot as everything else reads it: table, single read, JSON."""
+    raw = bytes((x, y, mul, crc))
+    return {
+        "index": index,
+        "addr": addr,
+        "x": x,
+        "y": y,
+        "mul": mul,
+        "crc": crc,
+        "crc_ok": slot_checksum_ok(x, y, mul, crc),
+        "dpi": None if raw == EMPTY_SLOT else dpi_decode(x, mul),
+    }
+
+
+def slot_bytes(slot: dict) -> bytes:
+    return bytes((slot["x"], slot["y"], slot["mul"], slot["crc"]))
+
+
 def slot_checksum_ok(x: int, y: int, mul: int, crc: int) -> bool:
     return (x + y + mul + crc) & 0xFF == 0x55
 
@@ -776,7 +799,14 @@ class HidrawIO:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return True
-            except OSError:
+            except OSError as exc:
+                # "Busy" is EAGAIN/EWOULDBLOCK (BlockingIOError) and, on some
+                # systems, EACCES. Anything else — EBADF after the receiver was
+                # pulled out, ENODEV — is not contention, and waiting two
+                # seconds to call it "another compxctl is talking to the mouse"
+                # would be a wrong answer to a real error.
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise RuntimeError(f"Cannot lock the node: {exc}") from exc
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(LOCK_POLL_MS / 1000.0)
@@ -1054,21 +1084,13 @@ class HidrawSession:
         for offset in range(DPI_TABLE_START, DPI_TABLE_END, PROBE_BLOCK_BYTES):
             block = self.read(offset, PROBE_BLOCK_BYTES)
             for local in range(0, PROBE_BLOCK_BYTES, DPI_SLOT_BYTES):
-                x, y, mul, crc = block[local : local + DPI_SLOT_BYTES]
                 addr = offset + local
                 slots.append(
-                    {
-                        "index": (addr - DPI_TABLE_START) // DPI_SLOT_BYTES,
-                        "addr": addr,
-                        "x": x,
-                        "y": y,
-                        "mul": mul,
-                        "crc": crc,
-                        "crc_ok": slot_checksum_ok(x, y, mul, crc),
-                        "dpi": None
-                        if bytes((x, y, mul, crc)) == EMPTY_SLOT
-                        else dpi_decode(x, mul),
-                    }
+                    slot_dict(
+                        (addr - DPI_TABLE_START) // DPI_SLOT_BYTES,
+                        addr,
+                        *block[local : local + DPI_SLOT_BYTES],
+                    )
                 )
         return slots
 
@@ -1093,10 +1115,16 @@ class HidrawSession:
             )
         return percent, charging, state
 
+    def dpi_slot(self, slot: int) -> dict:
+        """One DPI slot, read on its own: one transaction instead of the table."""
+        addr = dpi_slot_addr(slot)
+        block = self.read(addr, DPI_SLOT_BYTES)
+        return slot_dict(slot, addr, *block)
+
     def write_dpi(self, slot: int, code: int) -> None:
         """Write one DPI slot, then verify every byte reads back unchanged."""
         addr = dpi_slot_addr(slot)
-        payload = bytes((code, code, 0x00, (0x55 - 2 * code) & 0xFF))
+        payload = dpi_payload(code)
         self.write(addr, payload)
         back = self.read(addr, DPI_SLOT_BYTES)
         if back != payload:
@@ -1248,7 +1276,7 @@ BATTERY_STATE_LABELS: dict[int, str] = {0x02: "2.4G mode"}
 
 
 def _slot_text(slot: dict) -> str:
-    if bytes((slot["x"], slot["y"], slot["mul"], slot["crc"])) == EMPTY_SLOT:
+    if slot_bytes(slot) == EMPTY_SLOT:
         return "empty"
     if slot["dpi"] is not None:
         return str(slot["dpi"])
@@ -1327,10 +1355,10 @@ def slot_json(slot: dict, active_slot: int | None) -> dict:
         "addr": f"0x{slot['addr']:04X}",
         "dpi": slot["dpi"],
         "text": _slot_text(slot),
-        "empty": bytes((slot["x"], slot["y"], slot["mul"], slot["crc"])) == EMPTY_SLOT,
+        "empty": slot_bytes(slot) == EMPTY_SLOT,
         "checksum_ok": slot["crc_ok"],
         "active": slot["index"] == active_slot,
-        "bytes": bytes((slot["x"], slot["y"], slot["mul"], slot["crc"])).hex(" "),
+        "bytes": slot_bytes(slot).hex(" "),
         "raw": {"x": slot["x"], "y": slot["y"], "mul": slot["mul"], "crc": slot["crc"]},
     }
 
@@ -1738,8 +1766,10 @@ def cmd_dpi(args: argparse.Namespace) -> int:
                     f"slot {slot} holds an undecoded extended encoding; "
                     "refusing to overwrite it"
                 )
-        before = session.dpi_slots()[slot]
-        session.write_dpi(slot, code)
+        before = session.dpi_slot(slot)
+        changed = slot_bytes(before) != dpi_payload(code)
+        if changed:
+            session.write_dpi(slot, code)
 
     if as_json:
         print_json(
@@ -1750,12 +1780,19 @@ def cmd_dpi(args: argparse.Namespace) -> int:
                     "slot": slot,
                     "dpi": value,
                     "previous": slot_json(before, None),
+                    "changed": changed,
                     "verified": True,
                 },
             )
         )
         return 0
-    print(f"DPI set: slot {slot} -> {value} (was {_slot_text(before)})")
+    if changed:
+        print(f"DPI set: slot {slot} -> {value} (was {_slot_text(before)})")
+    else:
+        # Same four bytes already there: a config-memory write nobody asked for
+        # is wear on a chip whose budget is unknown, and a readback of a value
+        # that was never written proves nothing.
+        print(f"DPI already set: slot {slot} -> {value} (nothing written)")
     return 0
 
 
@@ -1957,6 +1994,10 @@ def main(argv: list[str] | None = None) -> int:
     except (RuntimeError, OSError, ValueError) as exc:
         return _fail(args, str(exc), 1)
     except KeyboardInterrupt:
+        if getattr(args, "json", False):
+            # A status bar that interrupts a slow run still gets one parseable
+            # document, like every other way this command can end.
+            return _fail(args, "interrupted", 130)
         print("\nInterrupted.", file=sys.stderr)
         return 130
 

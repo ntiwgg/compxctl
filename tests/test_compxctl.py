@@ -779,6 +779,19 @@ def test_session_takes_an_advisory_lock(tmp_path: Path) -> None:
     assert io.locks == [(3, compxctl.LOCK_WAIT_MS)]
 
 
+def test_a_broken_lock_is_not_reported_as_contention(tmp_path: Path) -> None:
+    """EBADF after the receiver was pulled out is not "another compxctl"."""
+
+    class BrokenLockIO(FakeHidrawIO):
+        def lock(self, fd: int, timeout_ms: int) -> bool:
+            raise RuntimeError("Cannot lock the node: [Errno 9] Bad file descriptor")
+
+    with pytest.raises(RuntimeError, match="Bad file descriptor"):
+        with make_session(BrokenLockIO(), tmp_path):
+            pass
+    assert BrokenLockIO().lock_available is True  # the fake default, unchanged
+
+
 def test_the_reading_descriptor_is_opened_only_after_the_lock(tmp_path: Path) -> None:
     """Otherwise the wait itself fills the queue with the previous session's
     replies, and the protocol cannot tell them from the answer being asked for."""
@@ -979,6 +992,43 @@ def test_session_battery_rejects_an_impossible_percentage(tmp_path: Path) -> Non
     with make_session(io, tmp_path) as session:
         with pytest.raises(RuntimeError, match="impossible percentage"):
             session.battery()
+
+
+def test_dpi_payload_is_the_four_bytes_a_slot_holds() -> None:
+    assert compxctl.dpi_payload(0x13) == bytes((0x13, 0x13, 0x00, 0x2F))
+    assert compxctl.slot_checksum_ok(*compxctl.dpi_payload(0x07))
+
+
+def test_slot_dict_and_slot_bytes_agree_with_the_table(tmp_path: Path) -> None:
+    plain = bytes((0x07, 0x07, 0x00, 0x47, 0x13, 0x13, 0x00, 0x2F))
+    extended = bytes((0x7B, 0x7B, 0x44, 0x1B, 0xEF, 0xEF, 0x00, 0x77))
+    io = FakeHidrawIO(
+        [
+            _read_reply(0x000C, plain),
+            _read_reply(0x0014, plain),
+            _read_reply(0x001C, plain),
+            _read_reply(0x0024, extended),  # slots 6 and 7, the undecoded pair
+        ]
+    )
+    with make_session(io, tmp_path) as session:
+        table = session.dpi_slots()
+    assert compxctl.slot_bytes(table[0]) == bytes((0x07, 0x07, 0x00, 0x47))
+    assert table[0]["dpi"] == 400 and table[0]["crc_ok"] is True
+    # Both are checksum-valid and neither is decoded: one has a multiplier byte,
+    # the other a code above 0x7F. `slot_dict` keeps them raw on purpose.
+    assert table[6]["crc_ok"] is True and table[6]["dpi"] is None
+    assert table[7]["crc_ok"] is True and table[7]["dpi"] is None
+
+
+def test_session_reads_one_slot_in_one_transaction(tmp_path: Path) -> None:
+    """Writing one slot does not need the whole table read first."""
+    io = FakeHidrawIO([_read_reply(0x0010, bytes((0x13, 0x13, 0x00, 0x2F)))])
+    with make_session(io, tmp_path) as session:
+        slot = session.dpi_slot(1)
+    assert slot["addr"] == 0x0010
+    assert slot["index"] == 1
+    assert slot["dpi"] == 1000
+    assert io.sent == [compxctl.build_read_frame(0x0010, 4)]
 
 
 def test_session_write_dpi_verifies_all_four_bytes(tmp_path: Path) -> None:
@@ -1810,13 +1860,9 @@ def test_dpi_list_json(monkeypatch, capsys, tmp_path: Path) -> None:
 
 def test_dpi_write_json_reports_the_previous_value(monkeypatch, capsys, tmp_path: Path) -> None:
     _mouse_for(monkeypatch, tmp_path)
-    block = bytes((0x07, 0x07, 0x00, 0x47, 0x13, 0x13, 0x00, 0x2F))
     io = FakeHidrawIO(
         [
-            _read_reply(0x000C, block),
-            _read_reply(0x0014, block),
-            _read_reply(0x001C, block),
-            _read_reply(0x0024, block),
+            _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),  # the slot as it is
             None,  # the write itself
             _write_ack(0x000C, bytes((0x13, 0x13, 0x00, 0x2F))),
             _read_reply(0x000C, bytes((0x13, 0x13, 0x00, 0x2F))),
@@ -1828,7 +1874,50 @@ def test_dpi_write_json_reports_the_previous_value(monkeypatch, capsys, tmp_path
     assert doc["write"]["slot"] == 0
     assert doc["write"]["dpi"] == 1000
     assert doc["write"]["verified"] is True
+    assert doc["write"]["changed"] is True
     assert doc["write"]["previous"]["dpi"] == 400
+
+
+def test_dpi_write_is_skipped_when_the_slot_already_holds_it(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    """A config-memory write nobody asked for is wear on an unknown budget."""
+    _mouse_for(monkeypatch, tmp_path)
+    io = FakeHidrawIO([_read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47)))])
+    monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
+    assert compxctl.main(["dpi", "--slot", "0", "400"]) == 0
+    out = capsys.readouterr().out
+    assert "already set" in out and "nothing written" in out
+    # one read of the slot, and nothing else on the wire
+    assert io.sent == [compxctl.build_read_frame(0x000C, 4)]
+
+
+def test_dpi_write_reports_an_unchanged_slot_in_json(monkeypatch, capsys, tmp_path: Path) -> None:
+    _mouse_for(monkeypatch, tmp_path)
+    io = FakeHidrawIO([_read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47)))])
+    monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
+    assert compxctl.main(["dpi", "--slot", "0", "400", "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["write"]["changed"] is False
+    assert doc["write"]["previous"]["dpi"] == 400
+
+
+def test_dpi_write_still_writes_when_only_the_checksum_byte_differs(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    """Comparing the whole payload, not just the code: a corrupt slot is repaired."""
+    _mouse_for(monkeypatch, tmp_path)
+    io = FakeHidrawIO(
+        [
+            _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x00))),  # right code, bad crc
+            None,
+            _write_ack(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),
+            _read_reply(0x000C, bytes((0x07, 0x07, 0x00, 0x47))),
+        ]
+    )
+    monkeypatch.setattr(compxctl, "HidrawSession", _session_factory(io))
+    assert compxctl.main(["dpi", "--slot", "0", "400"]) == 0
+    assert "DPI set: slot 0 -> 400" in capsys.readouterr().out
 
 
 def test_rate_show_json(monkeypatch, capsys, tmp_path: Path) -> None:
@@ -1882,6 +1971,21 @@ def test_keyboard_interrupt_exits_with_130(monkeypatch, capsys) -> None:
     monkeypatch.setattr(compxctl, "find_mouses", interrupted)
     assert compxctl.main(["rate"]) == 130
     assert "Interrupted" in capsys.readouterr().err
+
+
+def test_keyboard_interrupt_still_prints_a_document_with_json(monkeypatch, capsys) -> None:
+    """A bar that interrupts a slow run gets one parseable document, not nothing."""
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(compxctl, "find_mouses", interrupted)
+    assert compxctl.main(["status", "--json"]) == 130
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert doc["command"] == "status"
+    assert "interrupted" in doc["error"]["message"]
+    assert captured.err == ""
 
 
 def test_plain_error_goes_to_stderr(monkeypatch, capsys) -> None:

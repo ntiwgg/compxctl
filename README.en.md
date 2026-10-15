@@ -148,8 +148,12 @@ Device EEPROM updated to 500 Hz (0x02).
   That is expected: on this unit the stored interval does not change the endpoint, which stays at 1ms — the stored value is what the device itself sends at.
 ```
 
-It refuses to run without `--persist`, and when the stored value already matches
-it writes nothing and leaves the port alone. `--no-reset` leaves the reset to
+It refuses to run without `--persist`; when the stored value already matches, the
+EEPROM is not written and the port is left alone. The live packets still go out,
+and that is not redundancy: they set the rate **now**, while the EEPROM holds the
+one the mouse boots with. The two states are independent — another program may
+have changed the live rate, or an earlier run may have stopped between the
+packets and the write. `--no-reset` leaves the reset to
 you: it writes the value and still reminds you to re-plug, which is what you
 want if the receiver is shared with a keyboard and you would rather it did not
 disappear.
@@ -188,6 +192,14 @@ $ compxctl dpi --slot 3 2400     # writes an explicit slot 0..5
 
 The stored code is `DPI / 50 - 1`; DPI must be a multiple of 50 in 50..6400.
 Every write is verified by reading **all four bytes** back.
+
+A write reads the target slot alone (one transaction, not the whole table), and
+if those four bytes are already there the write is skipped: an unnecessary write
+to config memory is wear on a chip with an unknown budget, and reading back a
+value that was never written proves nothing. The text output says
+`DPI already set: slot 0 -> 400 (nothing written)` and JSON carries
+`"changed": false`. All four bytes are compared, so a slot with the right code
+and a broken checksum is still rewritten.
 
 Slots 6 and 7 on the verified unit hold an undecoded extended encoding. They are
 listed as raw bytes and never overwritten. Slot 6 holds `EF EF 00 77`, and `0xEF`
@@ -228,10 +240,13 @@ What you can rely on:
 
 * a runtime error is **one** JSON document on stdout:
   `{"schema": 1, "command": "status", "error": {"message": "..."}}`, with exit
-  code `1`;
+  code `1`; an interrupt (`Ctrl+C`, or SIGINT from a bar's timeout, exit code
+  `130`) produces the same document with `error` instead of an empty stdout;
 * a command-line error (exit code `2`) stays text on stderr and produces no
   document: that is a typo in your script, not a state of the device;
 * an unknown value is `null`, never the string `"n/a"`;
+* `dpi <value>` adds `write.changed` to the document: `false` means the slot
+  already held exactly that and nothing was written to the device;
 * `status` reads four things at once and does not die because of one: whatever
   could not be read lands in the `warnings` array and the rest is still there.
   `dpi` and `battery` read a single thing and answer with an `error` document
@@ -302,7 +317,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-202 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+210 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:

@@ -100,13 +100,28 @@ mismatch on a write that worked — never a silent wrong value — and
   of timeouts the session marks the device silent, `status` skips the remaining
   readouts and says so in `warnings`. A sleeping mouse now costs ~2 s instead of
   ~14 s, which is what makes polling it from a status bar reasonable.
+- `dpi <value>` reads the target slot on its own instead of the whole table, and
+  skips the write when those four bytes are already there: an unnecessary write
+  to config memory is wear on a chip with an unknown budget, and the readback of
+  a value that was never written proves nothing. JSON reports it as
+  `write.changed`.
+- `HidrawIO.lock` treats only real contention (`EAGAIN`/`EWOULDBLOCK`, `EACCES`)
+  as "someone else has it". A descriptor that went bad — the receiver pulled out
+  between `open` and `flock` — used to spend the whole two-second wait and then
+  be reported as another compxctl talking to the mouse; it now raises the actual
+  errno at once.
+- `--json` now prints its document when a run is interrupted as well (exit code
+  `130`). A status bar that kills a slow call for its own timeout used to get an
+  empty stdout, which is the one thing the JSON contract promises not to do.
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
-  descriptors captured from the hardware), the lock and the JSON documents: 202
+  descriptors captured from the hardware), the lock and the JSON documents: 210
   in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.
+- The unused `RATE_BY_CODE` table, which also contradicted the table in use:
+  it read `0x01` as 500 Hz where `RATE_BY_DEVICE_INTERVAL_CODE` reads 1000.
 
 ## [2.0.0] — 2026-09-11
 
