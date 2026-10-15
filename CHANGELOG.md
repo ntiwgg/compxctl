@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter stays put without the flag and goes up by one with it).
 - **Breaking:** `--no-reset` is gone, because it asked for what is now the
   default. Anyone passing it gets a usage error rather than a silent surprise.
+- **Breaking for `--json` consumers:** `JSON_SCHEMA` is 2. The `applied.reset`
+  field no longer takes the value `"manual"` (that flag is gone) and instead can
+  be `"not-requested"`, so a script switching on that value would silently take a
+  different branch. The CLI text and `--help` were also still promising what the
+  READMEs now refute — that the live packets change the rate — and say only what
+  was measured: the write, verified by readback.
 - The udev `usb_device` rule is now optional: only `--reset-port` needs it, so a
   system that never resets the port can install the `hidraw` rule alone.
 - `--timeout-ms` and `--tries` on every command that talks to the device. This is

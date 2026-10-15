@@ -57,8 +57,10 @@ from typing import Callable, NamedTuple, Sequence, TypeVar
 __version__ = "4.0.0"
 
 # Version of the `--json` documents. Bump it when a key changes meaning or
-# disappears; adding a key does not bump it.
-JSON_SCHEMA = 1
+# disappears, and when the set of values a key can take changes — 2 dropped the
+# `reset: "manual"` of 3.x in favour of `"not-requested"`; adding a new key does
+# not bump it.
+JSON_SCHEMA = 2
 
 # What a device readout returns; `_attempt` keeps that type when it swallows a
 # failed read into a warning.
@@ -866,8 +868,17 @@ def is_device_ack(report: bytes) -> bool:
     as an answer, so the only thing that tells them apart is the opcode they
     echo. They are the device talking about itself: not an answer to a question,
     and not evidence of another program on the node either.
+
+    The report id and the checksum are checked too: a damaged frame that happens
+    to carry 0x07 in its second byte is not this device's acknowledgement, and
+    treating it as one would let the session call a live node asleep.
     """
-    return len(report) == COMPX_FRAME_BYTES and report[1] in DEVICE_ACK_OPCODES
+    return (
+        len(report) == COMPX_FRAME_BYTES
+        and report[0] == COMPX_REPLY_REPORT_ID
+        and report[1] in DEVICE_ACK_OPCODES
+        and verify_frame(report)
+    )
 
 
 def is_config_reply(report: bytes) -> bool:
@@ -1628,12 +1639,14 @@ def apply_rate(
 def _reenumerate(mouse: Mouse, changed: bool, *, enabled: bool) -> tuple[str, str | None]:
     """Reset the port so the host re-reads the descriptors. (status, error).
 
-    Off by default, and the measurement is why: on the verified unit the
-    endpoint interval does not follow the stored interval code, so re-reading the
-    descriptors shows the same `1ms` it showed before, while the whole receiver —
-    keyboard included, if one shares it — drops off the bus for a second. The
-    live interval packets are what change the rate, and they are sent either way.
-    `--reset-port` asks for the re-enumeration when someone actually wants it.
+    Off by default, and the measurements are why: on the verified unit the
+    endpoint interval does not follow the stored interval code, and neither the
+    stored code nor the live interval packets change the stream of reports the
+    host receives (0% repeated reports with the live code at 500 and at 1000 —
+    see the README for the method). Re-reading the descriptors therefore shows the
+    same `1ms` as before, while the whole receiver — keyboard included, if one
+    shares it — leaves the bus for a second. `--reset-port` asks for it when
+    someone actually wants the re-enumeration.
 
     "skipped" means there was nothing to write in the first place;
     "not-requested" means the write happened and the port was left alone.
@@ -1712,12 +1725,14 @@ def _reenumeration_text(applied: AppliedRate, fresh: Mouse | None) -> list[str]:
     if applied.reset == "skipped":
         return []
     if applied.reset == "not-requested":
-        # The live packets already changed the rate; the EEPROM keeps it for the
-        # next power-up. Nothing needs re-plugging, and --reset-port is named for
-        # the case where someone wants the descriptors re-read anyway.
+        # What can be said without overclaiming: the write happened and was read
+        # back, the live packets went out, and the port was left alone. What the
+        # mouse reports at afterwards is not something this tool measures, and it
+        # used to say otherwise — see the README.
         return [
-            "  Rate applied now; the stored value is what the mouse boots with. "
-            "The port was not reset (--reset-port does that).",
+            "  EEPROM written and verified by readback; live interval packets "
+            "sent. The port was not reset (--reset-port does that).",
+            "  What the mouse reports at afterwards is not measured here.",
         ]
     if applied.reset == "failed":
         return [
@@ -1737,9 +1752,9 @@ def _reenumeration_text(applied: AppliedRate, fresh: Mouse | None) -> list[str]:
         return [reset_line]
     return [
         reset_line,
-        f"  That is expected: on this unit the stored interval does not change the "
-        f"endpoint, which stays at {endpoint.interval_raw if endpoint else '?'} — the "
-        "stored value is what the device itself sends at.",
+        "  The endpoint does not follow the stored interval on this unit, and "
+        "neither does the report stream — both are measured; the README says what "
+        "that does and does not mean for `rate device`.",
     ]
 
 
@@ -2043,9 +2058,10 @@ def build_parser() -> argparse.ArgumentParser:
             "override and the effective rate. `rate host HZ` writes "
             "usbhid.mousepoll (global, reversible, root). `rate device HZ "
             "--persist` rewrites the device's stored interval through the "
-            "vendor protocol (per-device, persistent, EEPROM wear). The live "
-            "interval packets take effect immediately; --reset-port additionally "
-            "re-enumerates the receiver so the host re-reads the descriptors."
+            "vendor protocol (per-device, persistent, EEPROM wear). The write is "
+            "verified by readback; what the mouse reports at afterwards is not "
+            "measured. --reset-port additionally re-enumerates the receiver so the "
+            "host re-reads the descriptors."
         ),
     )
     rate.add_argument(

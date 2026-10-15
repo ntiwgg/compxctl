@@ -153,7 +153,8 @@ reads the value back:
 ```console
 $ compxctl rate device 500 --persist
 Device EEPROM updated to 500 Hz (0x02).
-  Rate applied now; the stored value is what the mouse boots with. The port was not reset (--reset-port does that).
+  EEPROM written and verified by readback; live interval packets sent. The port was not reset (--reset-port does that).
+  What the mouse reports at afterwards is not measured here.
 ```
 
 The port is **not** reset by default, and the measurement is why: the reset was
@@ -168,7 +169,7 @@ actually wanted (say, to see what the host reports), ask for it:
 $ compxctl rate device 500 --persist --reset-port
 Device EEPROM updated to 500 Hz (0x02).
   Port reset: the receiver re-enumerated, and the host re-read the descriptors; the endpoint advertises 1000 Hz (1ms, ep_81).
-  That is expected: on this unit the stored interval does not change the endpoint, which stays at 1ms — the stored value is what the device itself sends at.
+  The endpoint does not follow the stored interval on this unit, and neither does the report stream — both are measured; the README says what that does and does not mean for `rate device`.
 ```
 
 It refuses to run without `--persist`; `--reset-port` additionally re-enumerates.
@@ -278,7 +279,7 @@ $ compxctl status --json | jq '.dpi_slots[] | select(.active) | .text'
 What you can rely on:
 
 * a runtime error is **one** JSON document on stdout:
-  `{"schema": 1, "command": "status", "error": {"message": "..."}}`, with exit
+  `{"schema": 2, "command": "status", "error": {"message": "..."}}`, with exit
   code `1`;
 * an interrupt produces the same document with `error` instead of an empty
   stdout: `Ctrl+C` exits `130`, `SIGTERM` exits `143`. The second one matters
@@ -312,9 +313,9 @@ never asked for.
 
 * `rate` (reading) needs nothing.
 * `rate host` needs root — it writes a kernel module parameter.
-* The device commands need access to the `/dev/hidraw*` node, and `--persist`
-  also to the USB device node (the port reset). Install the rule shipped in the
-  repository, or just run those commands with `sudo`:
+* The device commands need access to the `/dev/hidraw*` node; only
+  `--reset-port` also needs the USB device node (the re-enumeration). Install the
+  rule shipped in the repository, or just run those commands with `sudo`:
 
 ```console
 $ sudo cp 99-compx-mouse.rules /etc/udev/rules.d/

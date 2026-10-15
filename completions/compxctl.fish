@@ -2,7 +2,8 @@
 #
 # Mirrors the argparse CLI in compxctl.py:
 #   bare `compxctl` == `rate`; subcommands: rate status dpi battery probe.
-#   `--json` prints one JSON document and is available on every read command.
+#   Every command that talks to the device takes --timeout-ms and --tries;
+#   the read commands also take --json (one document, schema 2).
 #
 # Install by copying to ~/.config/fish/completions/compxctl.fish
 # (or run ./install.sh).
@@ -25,18 +26,28 @@ complete -c compxctl -n "__fish_seen_subcommand_from rate" -a "device" -d "write
 complete -c compxctl -n "__fish_seen_subcommand_from rate" -a "both" -d "apply on the host and in the device"
 complete -c compxctl -n "__fish_seen_subcommand_from rate" -a "125 500 1000"
 complete -c compxctl -n "__fish_seen_subcommand_from rate" -l persist -d "confirm the EEPROM write required by 'rate device'"
-complete -c compxctl -n "__fish_seen_subcommand_from rate" -l no-reset -d "after --persist, re-plug by hand instead of resetting the port"
-complete -c compxctl -n "__fish_seen_subcommand_from rate" -l json -d "print one JSON document (schema 1)"
+complete -c compxctl -n "__fish_seen_subcommand_from rate" -l reset-port -d "after --persist, re-enumerate the port so the host re-reads the descriptors"
+complete -c compxctl -n "__fish_seen_subcommand_from rate" -l json -d "print one JSON document (schema 2)"
+complete -c compxctl -n "__fish_seen_subcommand_from rate" -l timeout-ms -d "wait this long for one answer (default 500)"
+complete -c compxctl -n "__fish_seen_subcommand_from rate" -l tries -d "send a command at most this many times (default 4)"
 
 # dpi: 'list' value and target slot
 complete -c compxctl -n "__fish_seen_subcommand_from dpi" -a "list"
 complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l slot -d "slot index 0..5"
-complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l json -d "print one JSON document (schema 1)"
+complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l json -d "print one JSON document (schema 2)"
+complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l timeout-ms -d "wait this long for one answer (default 500)"
+complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l tries -d "send a command at most this many times (default 4)"
 
-# JSON output for the other read commands
-complete -c compxctl -n "__fish_seen_subcommand_from status" -l json -d "print one JSON document (schema 1)"
-complete -c compxctl -n "__fish_seen_subcommand_from battery" -l json -d "print one JSON document (schema 1)"
+# status and battery: JSON for status bars, and the same patience flags
+complete -c compxctl -n "__fish_seen_subcommand_from status" -l json -d "print one JSON document (schema 2)"
+complete -c compxctl -n "__fish_seen_subcommand_from status" -l timeout-ms -d "wait this long for one answer (default 500)"
+complete -c compxctl -n "__fish_seen_subcommand_from status" -l tries -d "send a command at most this many times (default 4)"
+complete -c compxctl -n "__fish_seen_subcommand_from battery" -l json -d "print one JSON document (schema 2)"
+complete -c compxctl -n "__fish_seen_subcommand_from battery" -l timeout-ms -d "wait this long for one answer (default 500)"
+complete -c compxctl -n "__fish_seen_subcommand_from battery" -l tries -d "send a command at most this many times (default 4)"
 
-# probe: config-memory window
+# probe: a window of config memory, up to the whole 64 KiB of it
 complete -c compxctl -n "__fish_seen_subcommand_from probe" -l start -d "start address (0x0000)"
-complete -c compxctl -n "__fish_seen_subcommand_from probe" -l length -d "bytes to read (max 0x100)"
+complete -c compxctl -n "__fish_seen_subcommand_from probe" -l length -d "bytes to read (max 0x10000)"
+complete -c compxctl -n "__fish_seen_subcommand_from probe" -l timeout-ms -d "wait this long for one answer (default 500)"
+complete -c compxctl -n "__fish_seen_subcommand_from probe" -l tries -d "send a command at most this many times (default 4)"

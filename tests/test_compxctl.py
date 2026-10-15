@@ -206,6 +206,24 @@ def test_is_device_ack_tells_the_firmware_talking_about_itself() -> None:
     assert not compxctl.is_device_ack(b"")
 
 
+def test_is_device_ack_rejects_a_damaged_frame() -> None:
+    """A frame with 0x07 in its second byte is not an acknowledgement if the
+    report id is wrong or the checksum does not hold: treating it as one would
+    let the session call a live node asleep."""
+    captured = bytes.fromhex(
+        "090700000002015400000000000000 00 ee".replace(" ", "")
+    )
+    assert len(captured) == compxctl.COMPX_FRAME_BYTES
+    assert compxctl.verify_frame(captured)
+    assert compxctl.is_device_ack(captured)  # the real capture from the unit
+
+    corrupted = bytearray(captured)
+    corrupted[10] ^= 0xFF
+    assert not compxctl.is_device_ack(bytes(corrupted))
+
+    assert not compxctl.is_device_ack(bytes([0x01]) + captured[1:])
+
+
 def test_is_config_reply_accepts_only_input_report_nine() -> None:
     frame = _reply(b"\x09\x08\x00\x00\x00\x02", b"\x01\x54")
     assert compxctl.is_config_reply(frame)
@@ -1641,7 +1659,8 @@ def test_applied_text_says_what_the_host_now_advertises(tmp_path: Path) -> None:
 def test_applied_text_explains_a_descriptor_that_does_not_follow(tmp_path: Path) -> None:
     """Measured on the verified unit: the stored code does not move bInterval."""
     text = " ".join(compxctl.applied_text(_applied(rate_hz=500), find_mouse(tmp_path)))
-    assert "does not change the endpoint" in text
+    assert "does not follow the stored interval" in text
+    assert "neither does the report stream" in text
 
 
 def test_applied_text_asks_for_a_replug_when_the_reset_failed(tmp_path: Path) -> None:
@@ -1660,9 +1679,13 @@ def test_applied_text_is_quiet_when_the_reset_was_skipped(tmp_path: Path) -> Non
 
 
 def test_applied_text_says_the_port_was_left_alone(tmp_path: Path) -> None:
+    """The output may not promise what the READMEs now refute: the rate the
+    device reports at is not something this tool measures."""
     text = " ".join(compxctl.applied_text(_applied(reset="not-requested"), find_mouse(tmp_path)))
-    assert "Rate applied now" in text
+    assert "verified by readback" in text
     assert "--reset-port" in text
+    assert "not measured here" in text
+    assert "applied now" not in text.lower()
 
 
 def test_applied_text_warns_when_the_device_stays_away(tmp_path: Path) -> None:

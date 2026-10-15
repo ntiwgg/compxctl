@@ -85,7 +85,8 @@ $ compxctl rate device 1000 --persist      # плюс запись в EEPROM м�
 ```console
 $ compxctl rate device 500 --persist
 Device EEPROM updated to 500 Hz (0x02).
-  Rate applied now; the stored value is what the mouse boots with. The port was not reset (--reset-port does that).
+  EEPROM written and verified by readback; live interval packets sent. The port was not reset (--reset-port does that).
+  What the mouse reports at afterwards is not measured here.
 ```
 
 Порт по умолчанию **не перезагружается**, и это следствие измерения: ресет задумывался ради того, чтобы хост перечитал дескриптор, но дескриптор за хранимым кодом не следует — `bInterval` остаётся `01` и при `0x01`, и при `0x02`, с обеих сторон перезагрузки, которую ядро залогировало как настоящую. Плата за него была реальной: второе правило udev с доступом ко **всему** USB-узлу ресивера и секунда, на которую с шины исчезает весь ресивер — вместе с клавиатурой, если она на нём. Если ре-нумерация нужна (например, посмотреть, что скажет хост), есть `--reset-port`:
@@ -94,7 +95,7 @@ Device EEPROM updated to 500 Hz (0x02).
 $ compxctl rate device 500 --persist --reset-port
 Device EEPROM updated to 500 Hz (0x02).
   Port reset: the receiver re-enumerated, and the host re-read the descriptors; the endpoint advertises 1000 Hz (1ms, ep_81).
-  That is expected: on this unit the stored interval does not change the endpoint, which stays at 1ms — the stored value is what the device itself sends at.
+  The endpoint does not follow the stored interval on this unit, and neither does the report stream — both are measured; the README says what that does and does not mean for `rate device`.
 ```
 
 Без `--persist` команда отказывается работать; флаг `--reset-port` просит дополнительно перезагрузить порт. Если в устройстве уже лежит нужное значение — в EEPROM не пишется ничего и порт не трогается.
@@ -186,7 +187,7 @@ $ compxctl status --json | jq '.dpi_slots[] | select(.active) | .text'
 
 Правила, на которые можно опираться:
 
-* ошибка выполнения — это **один** JSON-документ в stdout: `{"schema": 1, "command": "status", "error": {"message": "..."}}`, код возврата при этом `1`;
+* ошибка выполнения — это **один** JSON-документ в stdout: `{"schema": 2, "command": "status", "error": {"message": "..."}}`, код возврата при этом `1`;
 * прерывание даёт такой же документ с `error`, а не пустой stdout: `Ctrl+C` — код `130`, `SIGTERM` — код `143`. Второе важнее, чем кажется: Waybar, Polybar и i3status убивают зависший дочерний процесс именно `SIGTERM`, а у Python для него нет обработчика по умолчанию — без перехвата бар получил бы пустой вывод;
 * ошибка в аргументах командной строки (код `2`) остаётся текстом в stderr и документа не даёт: это опечатка в скрипте, а не состояние устройства;
 * неизвестное значение — это `null`, а не строка `"n/a"`;
@@ -200,7 +201,7 @@ $ compxctl status --json | jq '.dpi_slots[] | select(.active) | .text'
 
 * `rate` на чтение не требует ничего.
 * `rate host` требует root — это запись в параметр модуля ядра.
-* Командам устройства нужен доступ к узлу `/dev/hidraw*`, а для `--persist` ещё и к узлу USB (перезагрузка порта). Проще всего поставить udev-правило из репозитория:
+* Командам устройства нужен доступ к узлу `/dev/hidraw*`; только для `--reset-port` нужен ещё и узел USB (ре-нумерация порта). Проще всего поставить udev-правило из репозитория:
 
 ```console
 $ sudo cp 99-compx-mouse.rules /etc/udev/rules.d/
