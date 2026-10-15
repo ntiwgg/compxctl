@@ -11,3 +11,7 @@ dist/
 .pytest_cache/
 # `uv run pytest` writes a lockfile; this project has no dependencies to lock.
 uv.lock
+# Handover snapshots of the sources made for an external review: they are copies
+# of files that are already in the repository, and they go stale on the next
+# commit. Kept locally, never committed.
+ДЛЯ-РЕВЬЮ*.md
