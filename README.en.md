@@ -422,7 +422,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-246 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+247 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:

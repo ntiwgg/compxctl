@@ -204,7 +204,7 @@ mismatch on a write that worked — never a silent wrong value — and
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
   descriptors captured from the hardware), the lock, the signal handling, the
-  opt-in reset, the screen and the JSON documents: 246 in total.
+  opt-in reset, the screen and the JSON documents: 247 in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.

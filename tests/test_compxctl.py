@@ -1917,6 +1917,53 @@ def test_dpi_table_text_reports_an_unknown_active_level() -> None:
 # ==========================================================================
 
 
+@pytest.fixture(autouse=True)
+def no_real_machine(monkeypatch):
+    """A test may not read the machine it runs on.
+
+    `find_mouses()` walks the real /sys and `read_mousepoll()` the real kernel
+    parameter. A test that calls them passes where a mouse is plugged in and fails
+    on CI — which is exactly how one screen test was caught, after passing here.
+    Tests that need a device tree build a synthetic one and pass it in.
+    """
+    real_find, real_poll = compxctl.find_mouses, compxctl.read_mousepoll
+    real_poll_path = compxctl.MOUSEPOLL_PATH
+
+    def guarded_find(root=compxctl.SYSFS_USB_ROOT, hidraw_root=compxctl.SYSFS_HIDRAW_ROOT):
+        if root == compxctl.SYSFS_USB_ROOT and hidraw_root == compxctl.SYSFS_HIDRAW_ROOT:
+            raise AssertionError(
+                "a test looked for a real mouse on the USB bus; "
+                "pass a synthetic sysfs root instead"
+            )
+        return real_find(root, hidraw_root)
+
+    def guarded_poll(path=None):
+        # Redirecting the constant to a temporary file is the normal way to test
+        # this; reading the kernel's own parameter is what must not happen.
+        if Path(path or compxctl.MOUSEPOLL_PATH) == real_poll_path:
+            raise AssertionError(
+                "a test read the real usbhid.mousepoll; pass a path or redirect "
+                "MOUSEPOLL_PATH"
+            )
+        return real_poll(path)
+
+    monkeypatch.setattr(compxctl, "find_mouses", guarded_find)
+    monkeypatch.setattr(compxctl, "read_mousepoll", guarded_poll)
+
+
+def test_the_suite_cannot_reach_the_real_machine() -> None:
+    """The guard itself.
+
+    It exists because one screen test called the real device lookup: it passed on
+    a machine with a mouse plugged in and failed on CI. Pinning the guard keeps
+    the next such test from being written by accident.
+    """
+    with pytest.raises(AssertionError, match="real mouse"):
+        compxctl.find_mouses()
+    with pytest.raises(AssertionError, match="real usbhid.mousepoll"):
+        compxctl.read_mousepoll()
+
+
 class FakeCurses:
     """The names the screen uses, without a terminal under them.
 
@@ -2226,6 +2273,7 @@ def test_run_tui_reports_a_failed_write_instead_of_dying(monkeypatch) -> None:
 
 def test_run_tui_draws_every_slot_and_the_read_only_note(monkeypatch) -> None:
     monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    monkeypatch.setattr(compxctl, "tui_state", lambda args: tui_document())
     monkeypatch.setattr(compxctl, "tui_colours", lambda curses: {"ok": 0, "heading": 0, "hint": 0})
     screen = FakeScreen([ord("q")])
     compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"]))
