@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] — 2026-10-16
+
+### Fixed
+- **A DPI write to the level the mouse is on is now refused instead of silently
+  undone.** Reported from use: DPI changes "do not work at all, only the button on
+  the mouse". Measured, and the report was right: the mouse keeps the DPI it is
+  using in RAM and writes that value back over the active level's slot. A write
+  there reads back as correct — `write_dpi` verifies all four bytes — and is gone
+  five to ten seconds later, three observations out of three. Writes to levels the
+  mouse is not on hold, and are still in the dump minutes later. So `dpi N` (which
+  means "the level I am on") and `dpi --slot S` where S is active now fail with an
+  explanation and a way forward, and `tui` marks the active level read-only
+  alongside the undecoded slots 6 and 7.
+- The tray's DPI presets are gone. They wrote a value into whatever level the mouse
+  happened to be on — both the write the device undoes and a way to overwrite a
+  level the user was not looking at; in one session they flattened four levels to
+  the same value. The menu now shows the stored ladder read-only and sends editing
+  to the screen, which names the slot it is about to change.
+
+### Documented
+- The DPI section says what can and cannot be done from Linux: the ladder can be
+  set up, the current sensitivity cannot. The `dpi 2400` example is gone, because
+  that example no longer works.
+
 ## [4.2.0] — 2026-10-16
 
 ### Added
@@ -222,7 +246,7 @@ mismatch on a write that worked — never a silent wrong value — and
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
   descriptors captured from the hardware), the lock, the signal handling, the
-  opt-in reset, the screen and the JSON documents: 247 in total.
+  opt-in reset, the screen and the JSON documents: 250 in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.

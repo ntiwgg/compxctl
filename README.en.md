@@ -210,6 +210,10 @@ Which one do you want?
   1000 Hz one, but its effect is measurable. `rate device` writes the value into
   the mouse itself and verifies the write by reading it back, yet its effect could
   not be observed on this model (see the box above).
+* **"I want a different sensitivity now"** → not from Linux: the active level lives
+  in the mouse's RAM and is mirrored back over its slot within seconds.
+  `dpi --slot S N` sets up levels you are not on; the DPI button on the mouse is
+  what switches sensitivity.
 
 ### DPI
 
@@ -226,12 +230,24 @@ $ compxctl dpi list
    7   0x0028  7B   7B   44   1B    raw:0x7B(mul=0x44)
 Active DPI level: slot 0 (index 0x01)
 
-$ compxctl dpi 2400              # writes the active level's slot
-$ compxctl dpi --slot 3 2400     # writes an explicit slot 0..5
+$ compxctl dpi --slot 3 2400     # writes level 3 (slot 0..5)
 ```
 
 The stored code is `DPI / 50 - 1`; DPI must be a multiple of 50 in 50..6400.
 Every write is verified by reading **all four bytes** back.
+
+> **The level the mouse is on cannot be changed from Linux, and that is measured.**
+> The mouse keeps the DPI it is using in RAM and writes that value back over the
+> active level's slot: a write there reads back as correct and is gone five to ten
+> seconds later (three observations out of three). So `compxctl dpi 1600` — "make
+> mine 1600", which resolves to the level you are on — **refuses**, and explains
+> why, while `dpi --slot S` writes levels the mouse is not on, and those writes
+> hold. The sensitivity you feel right now is changed only by the mouse's own DPI
+> button, which switches level and lets the device take the value from its own
+> table.
+>
+> Practical meaning: the ladder of levels can be set up from Linux (writes to
+> inactive slots survive), the current sensitivity cannot.
 
 A write reads the target slot alone (one transaction, not the whole table), and
 if those four bytes are already there the write is skipped: an unnecessary write
@@ -490,6 +506,11 @@ All of the following was measured on an Ardor Gaming Ulta (`25a7:fa7b`), kernel
   ("re-plug the mouse so the host re-reads the descriptor") explained the effect
   wrongly: nothing in the descriptor changes, and the stored code governs how
   often the mouse itself sends — refuted below.
+* **The active DPI level belongs to the device.** A write into the slot of the
+  level the mouse is on reads back as correct and disappears within five to ten
+  seconds (three observations out of three): the mouse mirrors its RAM value back
+  over it. Writes to inactive levels hold, and are still in the dump minutes later.
+  This is why `dpi` refuses and why `tui` will not edit the active level.
 * **The live packets do not change the report stream.** Measured with a counter on
   the input reports (one report is one poll, unlike the removed `check`, which
   counted evdev events): with `live = 500` and `live = 1000` reports arrive at the
