@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] — 2026-10-16
+
+### Added
+- `compxctl tui`: a `curses` screen (standard library, imported only when the
+  screen is asked for, so a Python built without `_curses` still runs everything
+  else) showing the readings of `status` and editing DPI slots with the arrow
+  keys. It is a *view*, not a second implementation: it reads through
+  `collect_readouts` and writes through the same `apply_dpi_slot` the command line
+  uses, so the readback verification, the skip-when-unchanged rule and the refusal
+  to touch slots 6 and 7 all hold. A change is proposed first (`* not written`)
+  and written on Enter. `--tries` and `--timeout-ms` apply. Started without a
+  terminal it explains itself and exits `1`; `q`, `Esc`, `Ctrl+C` and `SIGTERM`
+  all restore the terminal, the last one with the usual `143`.
+- `contrib/`: panel widgets that share one adapter, `contrib/compx-status.sh`
+  (bash + `python3`, no `jq`) — a GNOME Argos/Guillotine/Executor file, a Waybar
+  `custom/compx` module with classes and a tooltip, and a Polybar
+  `[module/compx]`. A sleeping mouse is drawn as a state (`🖱️ —`) rather than an
+  error or an empty module, and the full-screen `tui` is started through a
+  terminal, since a panel has none.
+
+### Changed
+- `cmd_dpi` and the screen now share `apply_dpi_slot`, which is where the decision
+  to write (or not) lives; the command's behaviour is unchanged.
+
 ## [4.0.0] — 2026-10-15
 
 ### Documented after measuring
@@ -180,7 +204,7 @@ mismatch on a write that worked — never a silent wrong value — and
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
   descriptors captured from the hardware), the lock, the signal handling, the
-  opt-in reset and the JSON documents: 226 in total.
+  opt-in reset, the screen and the JSON documents: 246 in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.

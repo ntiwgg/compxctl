@@ -51,10 +51,11 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, NamedTuple, Sequence, TypeVar
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 # Version of the `--json` documents. Bump it when a key changes meaning or
 # disappears, and when the set of values a key can take changes — 2 dropped the
@@ -1848,6 +1849,26 @@ def _attempt(warnings: list[str], label: str, reader: Callable[[], ResultT]) -> 
         return None
 
 
+def apply_dpi_slot(session: HidrawSession, slot: int, dpi: int) -> tuple[bool, dict]:
+    """Write one DPI slot the way `dpi --slot S N` does. (changed, before).
+
+    The single place that decides this, for the command line and for the
+    interactive screen alike: read the target slot, skip the write when those
+    four bytes are already there, and let `write_dpi` verify the readback when
+    they are not.
+    """
+    code = dpi_code(dpi)
+    if code is None:
+        raise RuntimeError("DPI must be a multiple of 50 between 50 and 6400")
+    if not 0 <= slot <= DPI_WRITE_SLOT_MAX:
+        raise RuntimeError(f"slot must be 0..{DPI_WRITE_SLOT_MAX}")
+    before = session.dpi_slot(slot)
+    changed = slot_bytes(before) != dpi_payload(code)
+    if changed:
+        session.write_dpi(slot, code)
+    return changed, before
+
+
 def cmd_dpi(args: argparse.Namespace) -> int:
     value, slot_arg = args.value, args.slot
     as_json = getattr(args, "json", False)
@@ -1875,12 +1896,7 @@ def cmd_dpi(args: argparse.Namespace) -> int:
         return 0
 
     with session_for(args, mouse) as session:
-        code = dpi_code(value)
-        if code is None:
-            raise RuntimeError("DPI must be a multiple of 50 between 50 and 6400")
         if slot_arg is not None:
-            if not 0 <= slot_arg <= DPI_WRITE_SLOT_MAX:
-                raise RuntimeError(f"slot must be 0..{DPI_WRITE_SLOT_MAX}")
             slot = slot_arg
         else:
             active = session.active_dpi_level()
@@ -1896,10 +1912,7 @@ def cmd_dpi(args: argparse.Namespace) -> int:
                     f"slot {slot} holds an undecoded extended encoding; "
                     "refusing to overwrite it"
                 )
-        before = session.dpi_slot(slot)
-        changed = slot_bytes(before) != dpi_payload(code)
-        if changed:
-            session.write_dpi(slot, code)
+        changed, before = apply_dpi_slot(session, slot, value)
 
     if as_json:
         print_json(
@@ -2007,6 +2020,286 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 # ==========================================================================
+# Interactive screen — the same reads and writes as the commands, drawn instead
+# of printed. Nothing here talks to the device on its own: it calls the
+# functions above, so readback verification, the skip-when-unchanged economy and
+# the refusal to touch the undecoded slots are exactly the ones the CLI applies.
+# ==========================================================================
+
+TUI_DPI_MIN = 50
+TUI_DPI_MAX = 6400
+TUI_DPI_FINE = 50
+TUI_DPI_COARSE = 400
+TUI_EDITABLE_SLOTS = DPI_WRITE_SLOT_MAX + 1  # slots 0..5; 6 and 7 stay read-only
+TUI_HINT = (
+    "q выход · ↑/↓ слот · ←/→ ±50 DPI · [ ] ±400 · Enter записать · r обновить"
+)
+
+
+@lru_cache(maxsize=1)
+def _curses():
+    """The curses module, imported when the screen is actually asked for.
+
+    Lazily on purpose: a Python built without `_curses` (some minimal
+    distributions ship one) can still run every other command, and only this one
+    has to say why it cannot.
+    """
+    try:
+        import curses
+    except ImportError as exc:  # pragma: no cover - depends on the interpreter
+        raise RuntimeError(
+            "This Python has no `curses` module, so the interactive screen is "
+            "unavailable. Every other command works without it."
+        ) from exc
+    return curses
+
+
+def tui_state(args: argparse.Namespace) -> dict:
+    """The document `status --json` prints, for the screen to draw.
+
+    Same reader, same session, same timing flags: the screen is a view of the
+    status command, not a second implementation of it.
+    """
+    mouse = _require_mouse()
+    mousepoll_ms = read_mousepoll()
+    with session_for(args, mouse) as session:
+        readouts = collect_readouts(session)
+    return status_json(mouse, mousepoll_ms, readouts)
+
+
+def tui_editable(slot: dict) -> bool:
+    """Whether a slot may be written at all.
+
+    Slots 0..5 carry a decoded DPI; 6 and 7 carry an extended encoding nobody has
+    worked out, and the tool has always refused to guess there.
+    """
+    return slot.get("dpi") is not None and slot["index"] < TUI_EDITABLE_SLOTS
+
+
+def tui_step(dpi: int, delta: int) -> int:
+    """One keypress worth of change, kept inside what the protocol can encode."""
+    return min(TUI_DPI_MAX, max(TUI_DPI_MIN, dpi + delta))
+
+
+def tui_pending(state: dict) -> dict[int, int]:
+    """Slot index -> DPI as the screen currently proposes it (edits included)."""
+    return {
+        slot["index"]: slot["dpi"]
+        for slot in state.get("dpi_slots", [])
+        if tui_editable(slot)
+    }
+
+
+def tui_colours(curses) -> dict[str, int]:
+    """Colour pairs when the terminal has colours, plain attributes otherwise."""
+    plain = {"ok": curses.A_BOLD, "heading": curses.A_BOLD, "hint": 0}
+    if not curses.has_colors():
+        return plain
+    with contextlib.suppress(curses.error):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    if curses.COLOR_PAIRS <= 3:  # pragma: no cover - terminal without colour pairs
+        return plain
+    return {
+        "ok": curses.color_pair(1),
+        "heading": curses.color_pair(2) | curses.A_BOLD,
+        "hint": curses.color_pair(3),
+    }
+
+
+def tui_put(screen, row: int, column: int, text: str, attr: int = 0) -> None:
+    """`addstr` that cannot bring the screen down.
+
+    Writing into the bottom-right cell raises, and so does anything past the
+    edge: a screen that dies because a device name got long is worse than a
+    truncated name.
+    """
+    with contextlib.suppress(_curses().error):
+        height, width = screen.getmaxyx()
+        if 0 <= row < height and 0 <= column < width:
+            screen.addstr(row, column, text[: max(0, width - column - 1)], attr)
+
+
+def tui_draw(
+    screen, state: dict, selection: int, pending: dict[int, int], message: str, colours: dict
+) -> None:
+    """Draw the whole screen from the state — no device access, no decisions."""
+    curses = _curses()
+    screen.erase()
+    height, width = screen.getmaxyx()
+
+    title = " compxctl — CompX / Ardor Gaming "
+    tui_put(screen, 0, 0, title.ljust(width - 1), curses.A_REVERSE | curses.A_BOLD)
+
+    device = state.get("device") or {}
+    polling = state.get("polling") or {}
+    battery = state.get("battery") or {}
+    percent = battery.get("percent")
+    charge = "заряжается" if battery.get("charging") else "2.4G"
+
+    tui_put(screen, 2, 2, f"Устройство : {device.get('name') or '?'}", curses.A_BOLD)
+    tui_put(
+        screen,
+        3,
+        2,
+        f"Батарея    : {percent}% ({charge})" if percent is not None else "Батарея    : н/д",
+        colours["ok"],
+    )
+    tui_put(
+        screen,
+        4,
+        2,
+        f"Частота    : {polling.get('effective_rate_hz') or '?'} Гц "
+        f"({polling.get('effective_source') or '?'}), "
+        f"в EEPROM {state.get('stored_rate_hz') or 'н/д'} Гц",
+    )
+
+    tui_put(
+        screen,
+        6,
+        2,
+        "Слоты DPI — 0..5 правятся, 6..7 расшифровке не поддаются и только читаются:",
+        colours["heading"],
+    )
+    slots = state.get("dpi_slots", [])
+    for slot in slots:
+        row = 7 + slot["index"]
+        if row >= height - 3:
+            break
+        selected = slot["index"] == selection
+        proposed = pending.get(slot["index"])
+        changed = proposed is not None and proposed != slot["dpi"]
+        marks = "".join(
+            (
+                " [АКТИВЕН]" if slot.get("active") else "",
+                "" if tui_editable(slot) else " [только чтение]",
+                " * не записано" if changed else "",
+            )
+        )
+        value = str(proposed) if changed else slot.get("text", "?")
+        attr = curses.A_REVERSE if selected else curses.A_NORMAL
+        if slot.get("active"):
+            attr |= colours["ok"]
+        tui_put(
+            screen,
+            row,
+            2,
+            f"{'-> ' if selected else '   '}Слот {slot['index']}: {value:<8}{marks}",
+            attr,
+        )
+
+    warnings = state.get("warnings") or []
+    if warnings:
+        tui_put(screen, height - 3, 2, f"! {warnings[0]}", colours["hint"])
+    tui_put(screen, height - 2, 2, message, colours["hint"])
+    screen.refresh()
+
+
+def tui_unsupported(curses) -> str | None:
+    """Why a full-screen view has nothing to draw on here, or None when it has.
+
+    `TERM=dumb` (and anything else without cursor addressing) initialises fine and
+    then ignores every write: the screen stays blank and the user is left staring
+    at nothing with no idea why. Saying it out loud is the whole point.
+    """
+    if curses.tigetstr("cup") is None:
+        return (
+            f"this terminal ({os.environ.get('TERM', 'TERM is not set')}) cannot "
+            "position the cursor, so a full-screen view has nothing to draw on. "
+            "Run it in a normal terminal."
+        )
+    return None
+
+
+def tui_handle(key: int, selection: int, pending: dict[int, int]) -> tuple[int, dict[int, int]]:
+    """Apply one keypress to the proposal. (new selection, new proposal)."""
+    curses = _curses()
+    if key in (curses.KEY_UP, ord("k")):
+        return max(0, selection - 1), pending
+    if key in (curses.KEY_DOWN, ord("j")):
+        return min(len(pending) - 1 if pending else 0, selection + 1), pending
+    step = {
+        curses.KEY_LEFT: -TUI_DPI_FINE,
+        curses.KEY_RIGHT: TUI_DPI_FINE,
+        ord("["): -TUI_DPI_COARSE,
+        ord("]"): TUI_DPI_COARSE,
+        ord("h"): -TUI_DPI_FINE,
+        ord("l"): TUI_DPI_FINE,
+    }.get(key, 0)
+    if step and selection in pending:
+        return selection, {**pending, selection: tui_step(pending[selection], step)}
+    return selection, pending
+
+
+def run_tui(screen, args: argparse.Namespace) -> int:
+    """The event loop. Returns 0 when the user leaves; exceptions pass through."""
+    curses = _curses()
+    unsupported = tui_unsupported(curses)
+    if unsupported:
+        raise RuntimeError(unsupported)
+    with contextlib.suppress(curses.error):
+        curses.curs_set(0)  # a blinking cursor on a status screen is noise
+    colours = tui_colours(curses)
+    state = tui_state(args)
+    pending = tui_pending(state)
+    selection = 0
+    message = TUI_HINT
+
+    while True:
+        tui_draw(screen, state, selection, pending, message, colours)
+        key = screen.getch()
+
+        if key in (ord("q"), ord("Q"), 27):
+            return 0
+        if key in (ord("r"), ord("R")):
+            message = "Читаю устройство..."
+            tui_draw(screen, state, selection, pending, message, colours)
+            state = tui_state(args)
+            pending = tui_pending(state)
+            message = TUI_HINT
+            continue
+        if key in (curses.KEY_ENTER, 10, 13):
+            if selection not in pending:
+                message = f"Слот {selection} только для чтения — писать в него нельзя"
+                continue
+            try:
+                with session_for(args) as session:
+                    changed, before = apply_dpi_slot(session, selection, pending[selection])
+                message = (
+                    f"Слот {selection}: записано {pending[selection]} DPI и проверено чтением"
+                    if changed
+                    else f"Слот {selection}: уже {pending[selection]} DPI, запись не нужна"
+                )
+                state = tui_state(args)
+                pending = tui_pending(state)
+            except (RuntimeError, OSError, ValueError) as exc:
+                message = f"Не записано: {exc}"
+            continue
+
+        selection, pending = tui_handle(key, selection, pending)
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
+    """Run the interactive screen, or explain why it cannot be run."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise RuntimeError(
+            "`compxctl tui` needs a terminal, and stdin or stdout is not one. "
+            "Run it from a shell (or from a terminal emulator, if a status bar "
+            "is starting it)."
+        )
+    curses = _curses()
+    try:
+        return curses.wrapper(lambda screen: run_tui(screen, args))
+    except curses.error as exc:
+        # initscr failing (an unknown TERM, a terminal that went away) is a
+        # RuntimeError here like everything else the CLI reports, not a traceback.
+        raise RuntimeError(f"the terminal cannot run a full-screen view: {exc}") from exc
+
+
+# ==========================================================================
 # CLI
 # ==========================================================================
 
@@ -2102,6 +2395,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_timing_flags(battery)
     _add_json_flag(battery)
     battery.set_defaults(func=cmd_battery)
+
+    tui = subparsers.add_parser(
+        "tui",
+        help="interactive screen: look at the device and edit DPI slots",
+        description=(
+            "Opens a terminal screen with the same readings as `status` and "
+            "lets slots 0..5 be changed with the arrow keys. Slots 6 and 7 hold "
+            "an undecoded encoding and stay read-only, exactly as on the command "
+            "line, and a write is skipped when the slot already holds the value."
+        ),
+    )
+    _add_timing_flags(tui)
+    tui.set_defaults(func=cmd_tui)
 
     probe = subparsers.add_parser("probe", help="read config memory (read-only)")
     probe.add_argument("--start", type=_parse_int, default=0x0000)

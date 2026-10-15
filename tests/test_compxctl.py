@@ -1913,6 +1913,329 @@ def test_dpi_table_text_reports_an_unknown_active_level() -> None:
 
 
 # ==========================================================================
+# Interactive screen
+# ==========================================================================
+
+
+class FakeCurses:
+    """The names the screen uses, without a terminal under them.
+
+    Only constants and no-ops: a real `curses` function that touches the screen
+    state (`has_colors`, `curs_set`) is not safe to call before `initscr`, and
+    this suite has no terminal to initialise.
+    """
+
+    A_BOLD = 1
+    A_REVERSE = 2
+    A_NORMAL = 0
+    KEY_UP = 259
+    KEY_DOWN = 258
+    KEY_LEFT = 260
+    KEY_RIGHT = 261
+    KEY_ENTER = 343
+    COLOR_GREEN = COLOR_CYAN = COLOR_YELLOW = 2
+    COLOR_PAIRS = 64
+
+    class error(Exception):
+        pass
+
+    @staticmethod
+    def has_colors() -> bool:
+        return False
+
+    @staticmethod
+    def color_pair(_n: int) -> int:
+        return 0
+
+    @staticmethod
+    def start_color() -> None:
+        return None
+
+    @staticmethod
+    def use_default_colors() -> None:
+        return None
+
+    @staticmethod
+    def init_pair(_n: int, _fg: int, _bg: int) -> None:
+        return None
+
+    @staticmethod
+    def curs_set(_n: int) -> None:
+        return None
+
+    @staticmethod
+    def tigetstr(cap: str) -> bytes | None:
+        # A terminal that can position the cursor, like any real one.
+        return b"\x1b[%i;%iH" if cap == "cup" else None
+
+
+class FakeScreen:
+    """A window that records what was drawn and hands out scripted keys."""
+
+    def __init__(self, keys: list[int]) -> None:
+        self.keys = list(keys)
+        self.drawn: list[tuple[int, int, str]] = []
+
+    def getmaxyx(self) -> tuple[int, int]:
+        return (24, 100)
+
+    def erase(self) -> None:
+        self.drawn = []
+
+    def addstr(self, row: int, column: int, text: str, attr: int = 0) -> None:
+        self.drawn.append((row, column, text))
+
+    def refresh(self) -> None:
+        return None
+
+    def getch(self) -> int:
+        return self.keys.pop(0) if self.keys else ord("q")
+
+    def text(self) -> str:
+        return "\n".join(line for _, _, line in self.drawn)
+
+
+def tui_slot(index: int, dpi: int | None) -> dict:
+    """A slot row in the flat shape the protocol layer produces.
+
+    Built through `dpi_payload`, so the bytes and the checksum are the real ones
+    and the fixture cannot drift away from the encoder.
+    """
+    if dpi is None:  # slots 6 and 7: the extended encoding nobody decoded
+        x, y, mul, crc = 0xEF, 0xEF, 0x00, 0x77
+    else:
+        x, y, mul, crc = compxctl.dpi_payload(dpi // 50 - 1)
+    return {
+        "index": index,
+        "addr": compxctl.dpi_slot_addr(index),
+        "x": x,
+        "y": y,
+        "mul": mul,
+        "crc": crc,
+        "dpi": dpi,
+        "crc_ok": compxctl.slot_checksum_ok(x, y, mul, crc),
+    }
+
+
+def tui_document(*, slot_zero_dpi: int = 400, active_slot: int = 0) -> dict:
+    """The document `status --json` prints, as the screen receives it."""
+    rows = [tui_slot(0, slot_zero_dpi)]
+    rows += [tui_slot(index, 50 * (index + 1)) for index in range(1, 6)]
+    rows += [tui_slot(6, None), tui_slot(7, None)]
+    slots = [compxctl.slot_json(row, active_slot) for row in rows]
+    return {
+        "schema": 2,
+        "command": "status",
+        "device": {"name": "2.4G Dual Mode Mouse", "vendor": "25a7", "product": "fa7b",
+                   "sysfs": "3-2", "hidraw": "/dev/hidraw1"},
+        "polling": {"effective_rate_hz": 1000, "effective_source": "device descriptor"},
+        "stored_rate_hz": 1000,
+        "active_dpi": compxctl.active_dpi_json((active_slot + 1, slot_zero_dpi), rows),
+        "dpi_slots": slots,
+        "battery": {"percent": 100, "charging": False, "state": 2, "state_label": "2.4G mode"},
+        "warnings": [],
+    }
+
+
+class FakeWriteSession:
+    """A session that reports each slot the way the device does and records writes."""
+
+    def __init__(self, writes: list[tuple[int, int]]) -> None:
+        self.writes = writes
+        self.held = {index: (50 * (index + 1) if index else 400) for index in range(8)}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def dpi_slot(self, slot: int) -> dict:
+        return tui_slot(slot, self.held.get(slot))
+
+    def write_dpi(self, slot: int, code: int) -> None:
+        self.writes.append((slot, code))
+
+
+def test_parser_tui_takes_the_patience_flags_and_needs_no_json() -> None:
+    args = compxctl.build_parser().parse_args(["tui", "--tries", "1", "--timeout-ms", "150"])
+    assert (args.func, args.tries, args.timeout_ms) == (compxctl.cmd_tui, 1, 150)
+    assert not hasattr(args, "json")
+
+
+def test_tui_refuses_without_a_terminal(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(compxctl.sys.stdin, "isatty", lambda: False)
+    assert compxctl.main(["tui"]) == 1
+    assert "needs a terminal" in capsys.readouterr().err
+
+
+def test_tui_explains_a_python_without_curses(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(compxctl.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(compxctl.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setitem(sys.modules, "curses", None)  # `import curses` raises
+    compxctl._curses.cache_clear()
+    try:
+        assert compxctl.main(["tui"]) == 1
+        assert "no `curses` module" in capsys.readouterr().err
+    finally:
+        monkeypatch.undo()
+        compxctl._curses.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("start", "delta", "expected"), [(400, 50, 450), (400, -50, 350), (50, -50, 50),
+                                     (6400, 50, 6400), (1000, 400, 1400), (1000, -400, 600)]
+)
+def test_tui_step_stays_inside_what_the_protocol_encodes(start: int, delta: int, expected: int) -> None:
+    assert compxctl.tui_step(start, delta) == expected
+
+
+def test_tui_only_slots_zero_to_five_are_editable() -> None:
+    slots = tui_document()["dpi_slots"]
+    assert [compxctl.tui_editable(slot) for slot in slots] == [True] * 6 + [False] * 2
+    assert sorted(compxctl.tui_pending(tui_document())) == [0, 1, 2, 3, 4, 5]
+
+
+def test_tui_refuses_a_terminal_that_cannot_address_the_cursor(monkeypatch) -> None:
+    """`TERM=dumb` initialises and then ignores every write: a blank screen with
+    no explanation is worse than a sentence saying why."""
+
+    class DumbCurses(FakeCurses):
+        @staticmethod
+        def tigetstr(_cap: str) -> None:
+            return None
+
+    monkeypatch.setattr(compxctl, "_curses", lambda: DumbCurses)
+    assert "cannot position the cursor" in compxctl.tui_unsupported(DumbCurses)
+    monkeypatch.setattr(compxctl, "tui_state", lambda args: tui_document())
+    with pytest.raises(RuntimeError, match="cannot position the cursor"):
+        compxctl.run_tui(FakeScreen([ord("q")]), compxctl.build_parser().parse_args(["tui"]))
+    assert compxctl.tui_unsupported(FakeCurses) is None
+
+
+def test_tui_reports_a_broken_terminal_instead_of_raising_curses(monkeypatch, capsys) -> None:
+    """An unknown TERM makes initscr fail; that is a normal error message, not a
+    traceback out of the middle of curses."""
+
+    class BrokenCurses(FakeCurses):
+        @staticmethod
+        def wrapper(_fn):
+            raise BrokenCurses.error("terminal type unknown")
+
+    monkeypatch.setattr(compxctl, "_curses", lambda: BrokenCurses)
+    monkeypatch.setattr(compxctl.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(compxctl.sys.stdout, "isatty", lambda: True)
+    assert compxctl.main(["tui"]) == 1
+    assert "terminal type unknown" in capsys.readouterr().err
+
+
+def test_tui_handle_moves_selection_and_never_past_the_last_editable_slot() -> None:
+    pending = compxctl.tui_pending(tui_document())
+    selection = 0
+    for _ in range(20):
+        selection, pending = compxctl.tui_handle(FakeCurses.KEY_DOWN, selection, pending)
+    assert selection == 5  # not 6 or 7: they are read-only
+    for _ in range(20):
+        selection, pending = compxctl.tui_handle(FakeCurses.KEY_UP, selection, pending)
+    assert selection == 0
+
+
+def test_tui_handle_steps_the_selected_slot_only(monkeypatch) -> None:
+    monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    pending = compxctl.tui_pending(tui_document())
+    _, pending = compxctl.tui_handle(FakeCurses.KEY_RIGHT, 0, pending)
+    assert pending[0] == 450 and pending[1] == 100
+    _, pending = compxctl.tui_handle(ord("]"), 1, pending)
+    assert pending[1] == 500
+    _, pending = compxctl.tui_handle(ord("["), 1, pending)
+    assert pending[1] == 100
+
+
+def test_run_tui_edits_and_writes_the_selected_slot(monkeypatch) -> None:
+    """Right arrow proposes, Enter writes through the same path as `dpi`."""
+    monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    monkeypatch.setattr(compxctl, "tui_state", lambda args: tui_document())
+    monkeypatch.setattr(compxctl, "tui_colours", lambda curses: {"ok": 0, "heading": 0, "hint": 0})
+    writes: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        compxctl, "session_for", lambda args, mouse=None: FakeWriteSession(writes)
+    )
+    screen = FakeScreen([FakeCurses.KEY_RIGHT, FakeCurses.KEY_ENTER, ord("q")])
+    assert compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"])) == 0
+    assert writes == [(0, compxctl.dpi_code(450))]  # slot 0 moved 400 -> 450
+    assert "450" in screen.text()
+
+
+def test_run_tui_writes_nothing_when_the_slot_already_matches(monkeypatch) -> None:
+    monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    monkeypatch.setattr(compxctl, "tui_state", lambda args: tui_document())
+    monkeypatch.setattr(compxctl, "tui_colours", lambda curses: {"ok": 0, "heading": 0, "hint": 0})
+    writes: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        compxctl, "session_for", lambda args, mouse=None: FakeWriteSession(writes)
+    )
+    screen = FakeScreen([FakeCurses.KEY_ENTER, ord("q")])
+    assert compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"])) == 0
+    assert writes == []  # the four bytes were already there
+    assert "запись не нужна" in screen.text()
+
+
+def test_run_tui_refuses_to_write_a_slot_it_cannot_read(monkeypatch) -> None:
+    """The down arrow stops at slot 5, and a slot whose reading is gone — the
+    encoding of 6 and 7, or a refresh that lost one — is never written."""
+    monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    monkeypatch.setattr(compxctl, "tui_colours", lambda curses: {"ok": 0, "heading": 0, "hint": 0})
+    writes: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        compxctl, "session_for", lambda args, mouse=None: FakeWriteSession(writes)
+    )
+    reads = {"n": 0}
+
+    def state(args):
+        reads["n"] += 1
+        document = tui_document()
+        if reads["n"] > 1:  # a refresh that came back without slot 3
+            document["dpi_slots"][3]["dpi"] = None
+            document["dpi_slots"][3]["text"] = "raw:0xEF"
+        return document
+
+    monkeypatch.setattr(compxctl, "tui_state", state)
+    keys = [FakeCurses.KEY_DOWN, FakeCurses.KEY_DOWN, FakeCurses.KEY_DOWN, ord("r")]
+    keys += [FakeCurses.KEY_ENTER, ord("q")]
+    screen = FakeScreen(keys)
+    assert compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"])) == 0
+    assert writes == []
+    assert "только для чтения" in screen.text()
+
+
+def test_run_tui_reports_a_failed_write_instead_of_dying(monkeypatch) -> None:
+    monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    monkeypatch.setattr(compxctl, "tui_state", lambda args: tui_document())
+    monkeypatch.setattr(compxctl, "tui_colours", lambda curses: {"ok": 0, "heading": 0, "hint": 0})
+
+    class Refusing(FakeWriteSession):
+        def write_dpi(self, slot: int, code: int) -> None:
+            raise RuntimeError("Readback mismatch for slot 0")
+
+    monkeypatch.setattr(compxctl, "session_for", lambda args, mouse=None: Refusing([]))
+    screen = FakeScreen([FakeCurses.KEY_RIGHT, FakeCurses.KEY_ENTER, ord("q")])
+    assert compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"])) == 0
+    assert "Не записано" in screen.text()
+    assert "Readback mismatch" in screen.text()
+
+
+def test_run_tui_draws_every_slot_and_the_read_only_note(monkeypatch) -> None:
+    monkeypatch.setattr(compxctl, "_curses", lambda: FakeCurses)
+    monkeypatch.setattr(compxctl, "tui_colours", lambda curses: {"ok": 0, "heading": 0, "hint": 0})
+    screen = FakeScreen([ord("q")])
+    compxctl.run_tui(screen, compxctl.build_parser().parse_args(["tui"]))
+    text = screen.text()
+    assert "Слот 0" in text and "Слот 7" in text
+    assert text.count("[только чтение]") == 2  # slots 6 and 7
+    assert "[АКТИВЕН]" in text
+
+
+# ==========================================================================
 # --json end to end
 # ==========================================================================
 

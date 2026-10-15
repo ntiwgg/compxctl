@@ -259,6 +259,62 @@ $ compxctl battery                      # percent, charging, link mode
 $ compxctl probe --start 0x0000 --length 0x20   # read-only config memory dump
 ```
 
+### Interactive screen: `tui`
+
+```console
+$ compxctl tui
+```
+
+A full-screen `curses` mode (standard library too): the readings of `status`, and
+DPI slots edited with the arrow keys.
+
+```
+ compxctl — CompX / Ardor Gaming
+  Device     : 2.4G Dual Mode Mouse
+  Battery    : 100% (2.4G)
+  Rate       : 1000 Hz (device descriptor), stored 1000 Hz
+  DPI slots — 0..5 editable, 6..7 undecoded and read-only:
+  -> Slot 0: 400      [ACTIVE]
+     Slot 1: 1000
+     …
+     Slot 6: raw:0xEF [read-only]
+  q quit · ↑/↓ slot · ←/→ ±50 DPI · [ ] ±400 · Enter write · r refresh
+```
+
+What matters:
+
+* **No second protocol.** The screen calls the same functions as the commands:
+  `collect_readouts` to read and `apply_dpi_slot` to write, so a write is verified
+  by readback and four identical bytes are not written at all.
+* **Slots 6 and 7 are read-only.** The down arrow stops at slot 5, and 6 and 7
+  carry a marker: an undecoded encoding cannot be overwritten, by accident or
+  otherwise.
+* **A change is proposed first, written second.** An arrow key edits the proposal
+  (marked `* not written`), Enter writes it, and only for the selected slot.
+* **The terminal is restored** on `q`, `Esc`, `Ctrl+C` and `SIGTERM` (the last one
+  exits `143`, as everywhere). Started without a terminal, it explains itself and
+  exits `1`.
+* `--tries` and `--timeout-ms` apply here too: the screen reads the device with
+  the patience the command line asked for.
+
+### Ready-made integrations: `contrib/`
+
+The repository ships panel widgets — all through one adapter,
+`contrib/compx-status.sh` (bash + `python3`, no `jq`), so that three widgets
+cannot drift apart in formatting:
+
+| File | Where | What it gives |
+|---|---|---|
+| `contrib/compx-status.sh` | into `PATH` (`~/.local/bin`) | the tool's JSON → one line, Waybar JSON, or the Argos format |
+| `contrib/gnome-argos/compx.30s.sh` | `~/.config/argos/` | a GNOME widget (Argos, Guillotine, Executor): battery, DPI, a menu of presets and a way into `tui` |
+| `contrib/waybar/config.jsonc` | into the Waybar config | a `custom/compx` module with a tooltip, `charging`/`discharging`/`asleep` classes and `tui` on middle click |
+| `contrib/polybar/module.ini` | into the Polybar config | `[module/compx]` with the same text and clicks |
+
+A sleeping mouse is a state, not an error: the widget keeps its place and says
+`🖱️ —` instead of emptying itself or waiting out `4 × 500 ms`. A full-screen `tui`
+from a panel needs a terminal (`foot -e compxctl tui`) — the panel itself has
+none.
+
 ### Machine-readable output: `--json`
 
 `rate`, `status`, `dpi` and `battery` accept `--json` — exactly one JSON
@@ -366,7 +422,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-226 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+246 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:

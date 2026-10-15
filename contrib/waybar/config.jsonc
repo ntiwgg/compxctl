@@ -1,0 +1,41 @@
+// Waybar module for a CompX mouse — drop into ~/.config/waybar/config.jsonc and
+// add "custom/compx" to modules-right (or modules-left).
+//
+// Needs:
+//   * compx-status from this directory in PATH (~/.local/bin/compx-status), or
+//     an absolute path in "exec" below;
+//   * Waybar with `return-type: json` support (0.9.17+), which is what turns the
+//     tool's document into text, tooltip and a CSS class.
+//
+// Middle click opens the interactive screen. Waybar has no terminal of its own,
+// so the command has to start one: replace `foot` with your terminal
+// (`alacritty -e`, `kitty`, `gnome-terminal --`, `xterm -e`, …).
+{
+  "custom/compx": {
+    // --tries 1 --timeout-ms 150 is the bar setting: an awake mouse answers in
+    // single-digit milliseconds, so there is no point waiting out the default.
+    "exec": "compx-status --format waybar",
+    "return-type": "json",
+    "interval": 10,
+    "tooltip": true,
+    // Left click: the DPI table; middle click: the interactive screen. Waybar
+    // refreshes the module on `interval` by itself, so there is nothing to bind
+    // for "refresh now".
+    "on-click": "foot -e compxctl dpi list",
+    "on-click-middle": "foot -e compxctl tui",
+    // One class per state, so the bar can colour it:
+    //   .charging    — on the cable
+    //   .discharging — on battery
+    //   .asleep      — the mouse did not answer (switched off, or out of range)
+    "format": "{icon} {text}",
+    "format-icons": {
+      "charging": "⚡",
+      "discharging": "🖱️",
+      "asleep": "🖱️"
+    },
+    "states": {
+      "warning": 20,
+      "critical": 10
+    }
+  }
+}
