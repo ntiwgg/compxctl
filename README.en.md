@@ -228,6 +228,10 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uaccess"
 ```
 
+`./install.sh` does not silently overwrite a rule that is already there: if the
+file exists and differs, the previous version is kept beside it as
+`99-compx-mouse.rules.bak.<date>`, and `--uninstall` says where those copies are.
+
 `TAG+="uaccess"` covers an active logind session. The `usb_device` rule is only
 needed for the port reset: without it, `rate device --persist` still writes the
 value, skips the reset and says so. Note that a `GROUP="users"` fallback is a

@@ -40,7 +40,7 @@ run_as_root() {
 install_udev() {
     [[ -f "$UDEV_RULES_SRC" ]] || die "udev rules file not found: $UDEV_RULES_SRC"
     echo "Installing udev rule for CompX / Ardor Gaming mice (VID 25a7)…"
-    run_as_root cp "$UDEV_RULES_SRC" "$UDEV_RULES_DEST"
+    install_rules_file
     run_as_root udevadm control --reload-rules
     # Target the vendor rather than retriggering every device on the system.
     # The hidraw nodes are separate devices in udev's eyes and have to be
@@ -50,12 +50,40 @@ install_udev() {
     echo "udev rules installed. Re-plug your mouse (or log out and back in) to apply them."
 }
 
+# Put the rules file in place without destroying what was already there.
+#
+# This path is also where a hand-written vendor rule tends to live — the machine
+# this project was developed on had one, written before the repository had any,
+# and it granted access in a way the new file does not (a group, not logind, so
+# it also worked over SSH). Overwriting it silently would take that access away
+# with nothing to go back to.
+install_rules_file() {
+    local stamp backup
+    if [[ -e "$UDEV_RULES_DEST" ]] && ! cmp -s "$UDEV_RULES_SRC" "$UDEV_RULES_DEST"; then
+        stamp="$(date +%Y%m%d-%H%M%S)"
+        backup="$UDEV_RULES_DEST.bak.$stamp"
+        run_as_root cp -p "$UDEV_RULES_DEST" "$backup"
+        echo "A different rule was already installed; it is kept as:"
+        echo "  $backup"
+        echo "Compare them before deleting the copy: a GROUP= rule also works over SSH,"
+        echo "where there is no logind session to hand out a uaccess ACL."
+    fi
+    run_as_root cp "$UDEV_RULES_SRC" "$UDEV_RULES_DEST"
+}
+
 uninstall_udev() {
     echo "Removing udev rule $UDEV_RULES_DEST…"
     run_as_root rm -f "$UDEV_RULES_DEST"
     run_as_root udevadm control --reload-rules
     run_as_root udevadm trigger --subsystem-match=usb --attr-match=idVendor=25a7
     run_as_root udevadm trigger --subsystem-match=hidraw
+    local backups
+    backups="$(compgen -G "$UDEV_RULES_DEST.bak.*" || true)"
+    if [[ -n "$backups" ]]; then
+        echo "Backups of earlier rules are still on disk (never installed):"
+        # shellcheck disable=SC2086
+        printf '  %s\n' $backups
+    fi
     echo "udev rule removed. Re-plug your mouse to restore default access."
 }
 

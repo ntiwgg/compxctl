@@ -60,6 +60,12 @@ from end to end, and no kernel driver is detached any more.
   on hardware) raised `AssertionError`, which no caller rendered: they now raise
   `RuntimeError` like every other refusal, so the user gets one error line or one
   JSON document instead of a traceback.
+- `install.sh` overwrote an existing udev rule in place. That path is also where
+  a hand-written vendor rule tends to live — the machine this was developed on
+  had one, granting access through a group, which also works over SSH where a
+  `uaccess` ACL does not exist. A differing file is now kept as
+  `99-compx-mouse.rules.bak.<timestamp>`, `--uninstall` says where those copies
+  are, and an identical file is not backed up again.
 
 What is inherent rather than fixed: the vendor protocol has no sequence number,
 so a duplicate of the read taken *before* an EEPROM write cannot be told from
