@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Tests (no hardware, no pyusb, no root)
+      - name: Tests (no hardware, no /dev/hidraw, no root)
         run: |
           pip install pytest
           pytest -v
@@ -27,22 +27,25 @@ jobs:
           pip install .
           compxctl --version
 
-      - name: 'Check `rate` works with the standard library alone'
+      - name: Every command must run on a bare interpreter
         run: |
-          # The whole point of the rewrite: reading the polling rate needs no
-          # third-party package. If pyusb were installed, this check would pass
-          # for the wrong reason, so fail loudly instead.
-          if python -c "import usb" 2>/dev/null; then
-            echo "::error::pyusb is installed; this check would not prove isolation"
-            exit 1
-          fi
+          # The promise is "standard library only, no packages at all", and the
+          # test suite enforces it by reading compxctl.py's own AST. This step
+          # proves the other half: the commands actually start and fail cleanly
+          # instead of dying on a missing import.
+          #
+          # `set +e`: with no CompX mouse on a runner, exit status 1 is the
+          # correct answer, and Actions runs this shell with -e.
+          set +e
           python compxctl.py --version
-          # GitHub runs this script with `bash -e`, and a runner has no CompX
-          # mouse, so exit status 1 is expected and must not abort the step.
-          status=0
-          python compxctl.py rate || status=$?
-          # 0 = a mouse was found; 1 = no CompX mouse on this runner (expected).
-          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
-            echo "::error::unexpected exit status $status"
-            exit 1
-          fi
+          for command in "rate" "rate --json" "status --json" "battery" "dpi list"; do
+            echo "--- compxctl $command"
+            # shellcheck disable=SC2086
+            python compxctl.py $command
+            status=$?
+            # 0 = a mouse was found; 1 = no CompX mouse on this runner (expected).
+            if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+              echo "::error::unexpected exit status $status for: $command"
+              exit 1
+            fi
+          done

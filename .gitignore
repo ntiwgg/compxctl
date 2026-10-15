@@ -9,3 +9,5 @@ dist/
 
 # Tooling
 .pytest_cache/
+# `uv run pytest` writes a lockfile; this project has no dependencies to lock.
+uv.lock

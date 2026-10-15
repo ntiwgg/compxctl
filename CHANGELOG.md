@@ -5,6 +5,83 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] — 2026-10-15
+
+The device commands stopped using pyusb. They reach the config interface
+through `/dev/hidrawN` with `fcntl.ioctl`, so the tool is standard library only
+from end to end, and no kernel driver is detached any more.
+
+### Changed
+- **Breaking:** the `device` extra is gone — `pip install ".[device]"` becomes
+  `pip install .`, because there is nothing left to install.
+- **Breaking:** the udev rules now cover `SUBSYSTEM=="hidraw"` as well.
+  A system still running the 2.x rules has no access to the hidraw node, so
+  device commands fail with a permission error until they are reinstalled.
+- Device commands no longer detach `usbhid`, so `status`, `battery`, `dpi` and
+  `probe` no longer make the pointer stutter while they run.
+- Every frame now goes out as `SET_REPORT(FEATURE)` — report ids 6 and 8 are
+  FEATURE reports in the device's own report descriptor. The pyusb path sent the
+  writes as OUTPUT reports; the firmware accepts both, and hidraw offers the
+  feature route.
+- `rate device --persist` resets the port itself (`USBDEVFS_RESET`) instead of
+  telling you to re-plug the receiver. `--no-reset` keeps the re-plug a human
+  step, and the command still says so.
+- READMEs rewritten around the hidraw transport; the JSON output and the
+  measured behaviour of the stored interval are documented.
+
+### Fixed
+- A readback after a config write could return a reply that belonged to an
+  earlier command of the same address, reporting a failed write that had in fact
+  succeeded. Two causes: the reply filter compared the address and length but
+  not the opcode, so a write's acknowledge (`09 07 …`, an echo of the written
+  bytes) passed as an answer; and every retry re-sent the command, leaving one
+  extra reply in the queue per stale frame. The filter now matches the opcode
+  too, and a command is sent once per attempt while the queue is drained.
+- `find_mouses` could return a hidraw node belonging to the motion interface
+  instead of the config interface, because the lookup matched any interface of
+  the device. Writing a feature report to the motion node fails with `EPIPE`.
+- `rate both HZ` without `--persist` refused *after* writing `usbhid.mousepoll`,
+  so a rejected command had already changed the host. The refusal is now checked
+  before the first side effect.
+- The reset was reported as `"ok"` from the ioctl returning, even if the device
+  never came back. `"ok"` now means it is on the bus again with a readable
+  endpoint; otherwise the result is `"failed"` with the reason.
+- A short read (`b""`) or a device that never stops talking could spin the
+  queue drain forever; it now ends on a short read and after a frame ceiling.
+- `build_write_frame` did not check that the payload stays inside the config
+  memory, which the read path has always done.
+- `cmd_dpi --json` printed its document before the session was closed, so a
+  failure to close could have put two documents on stdout.
+- The EEPROM readback compared only the interval code at `0x0000`. The
+  complement byte written beside it is verified too, and a stored pair that no
+  longer satisfies the `0x55` checksum is rewritten instead of being taken for
+  "already set".
+- The protocol-drift guards (a frame that no longer matches the capture verified
+  on hardware) raised `AssertionError`, which no caller rendered: they now raise
+  `RuntimeError` like every other refusal, so the user gets one error line or one
+  JSON document instead of a traceback.
+
+What is inherent rather than fixed: the vendor protocol has no sequence number,
+so a duplicate of the read taken *before* an EEPROM write cannot be told from
+the answer to the read after it. That can only turn into a loud readback
+mismatch on a write that worked — never a silent wrong value — and
+`persist_rate`'s docstring says so.
+
+### Added
+- `--json` on `rate`, `status`, `dpi` and `battery`: exactly one JSON document
+  on stdout (schema 1), errors included, unknown values as `null`, partial
+  failures collected in `warnings`. `status --json` is safe to poll from a
+  status bar.
+- Automatic port reset after `rate device --persist`, with a report of what the
+  host sees afterwards.
+- A test that reads this module's own AST and fails on any import outside the
+  standard library, so "no dependencies" stays a checked property.
+- Tests for hidraw node lookup, the write acknowledge, the leftover-reply
+  readback, the port reset, the JSON documents and the queue drain: 185 in total.
+
+### Removed
+- The `pyusb` dependency, the `[device]` extra and every import of it.
+
 ## [2.0.0] — 2026-09-11
 
 A rewrite. The polling rate no longer goes through the vendor EEPROM: it is read

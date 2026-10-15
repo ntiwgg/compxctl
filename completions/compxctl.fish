@@ -2,6 +2,7 @@
 #
 # Mirrors the argparse CLI in compxctl.py:
 #   bare `compxctl` == `rate`; subcommands: rate status dpi battery probe.
+#   `--json` prints one JSON document and is available on every read command.
 #
 # Install by copying to ~/.config/fish/completions/compxctl.fish
 # (or run ./install.sh).
@@ -24,10 +25,17 @@ complete -c compxctl -n "__fish_seen_subcommand_from rate" -a "device" -d "write
 complete -c compxctl -n "__fish_seen_subcommand_from rate" -a "both" -d "apply on the host and in the device"
 complete -c compxctl -n "__fish_seen_subcommand_from rate" -a "125 500 1000"
 complete -c compxctl -n "__fish_seen_subcommand_from rate" -l persist -d "confirm the EEPROM write required by 'rate device'"
+complete -c compxctl -n "__fish_seen_subcommand_from rate" -l no-reset -d "after --persist, re-plug by hand instead of resetting the port"
+complete -c compxctl -n "__fish_seen_subcommand_from rate" -l json -d "print one JSON document (schema 1)"
 
 # dpi: 'list' value and target slot
 complete -c compxctl -n "__fish_seen_subcommand_from dpi" -a "list"
 complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l slot -d "slot index 0..5"
+complete -c compxctl -n "__fish_seen_subcommand_from dpi" -l json -d "print one JSON document (schema 1)"
+
+# JSON output for the other read commands
+complete -c compxctl -n "__fish_seen_subcommand_from status" -l json -d "print one JSON document (schema 1)"
+complete -c compxctl -n "__fish_seen_subcommand_from battery" -l json -d "print one JSON document (schema 1)"
 
 # probe: config-memory window
 complete -c compxctl -n "__fish_seen_subcommand_from probe" -l start -d "start address (0x0000)"

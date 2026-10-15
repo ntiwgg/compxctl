@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compxctl"
-version = "2.0.0"
+version = "3.0.0"
 description = "Polling rate and DPI for CompX / Ardor Gaming mice on Linux"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-# `rate` needs nothing but the standard library. pyusb is required only by the
-# device commands (dpi, status, battery, probe, rate device), so it is an extra
-# rather than a hard dependency.
+# No dependencies and no optional ones: the device commands talk to /dev/hidrawN
+# through fcntl.ioctl, which is the standard library. There is nothing to
+# install beyond Python itself — the test suite enforces that by reading this
+# module's own AST.
 dependencies = []
 
 [project.optional-dependencies]
-device = ["pyusb"]
 test = ["pytest"]
 
 [project.scripts]

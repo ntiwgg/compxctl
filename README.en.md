@@ -8,8 +8,11 @@ very different places, and it is careful not to blur them:
 
 | What | Where it lives | How compxctl does it | Packages needed |
 |---|---|---|---|
-| Polling rate | the host's USB polling loop | `usbhid.mousepoll` + the endpoint descriptor in sysfs | **none** (stdlib only) |
-| DPI, battery, config memory | inside the mouse chip | the vendor HID protocol over raw USB | `pyusb` |
+| Polling rate | the host's USB polling loop | `usbhid.mousepoll` + the endpoint descriptor in sysfs | **none** |
+| DPI, battery, config memory | inside the mouse chip | the vendor HID protocol over `/dev/hidraw*` | **none** |
+
+There are no dependencies at all: both sysfs and hidraw are reachable from the
+Python standard library. A test enforces that by reading `compxctl.py`'s own AST.
 
 ```console
 $ compxctl rate
@@ -18,6 +21,8 @@ Device advertises: 1000 Hz (1ms via interval, ep_81)
 Host override: none (usbhid.mousepoll = 0)
 Effective: 1000 Hz (from device descriptor)
 ```
+
+Русский: [README.md](README.md)
 
 ## Why this exists (and why it is a rewrite)
 
@@ -39,27 +44,45 @@ interval for all mice. So:
 * **Setting the rate on the host** is one sysfs write to
   `/sys/module/usbhid/parameters/mousepoll`. Reversible, no EEPROM, no vendor
   protocol.
-* **Writing the device's stored interval** still exists, because it is the only
-  way to change what the mouse advertises to *any* host (including Windows), but
-  it is now an explicit opt-in behind `--persist`.
+* **Writing the device's own setting** still exists, because it is the only way
+  to change the mouse itself, but it is an explicit opt-in behind `--persist`.
+
+In 3.0 the device is no longer opened through libusb: the config interface is a
+HID interface, `usbhid` owns it, and the kernel hands it to user space as a
+`/dev/hidrawN` node. Two consequences: `pyusb` is gone, and `status`/`battery`
+stopped disturbing the mouse — libusb had to detach the kernel driver for the
+duration of a command, which made the pointer freeze for a moment.
+
+## How it works
+
+The report descriptor of the config interface (189 bytes, read from the
+verified unit) explains the whole protocol:
+
+| Report | Type | Length | What it is |
+|---|---|---|---|
+| id 6 | FEATURE | 7 bytes | the first live interval packet |
+| id 8 | FEATURE | 16 bytes | config-memory read/write, battery request |
+| id 9 | INPUT | 16 bytes | every reply the firmware sends |
+
+So a request goes out as one `fcntl.ioctl` with `HIDIOCSFEATURE` (which *is*
+`SET_REPORT` of the declared type), and the answer is read from the input
+report queue. `HIDIOCGFEATURE` (`GET_REPORT`) returns 17 zero bytes on this
+firmware — replies only ever arrive as an input report, and that is a
+measurement, not a guess.
+
+The interface also carries traffic of its own: an acknowledge for every live
+interval packet (`09 11 …`) and for every config write (`09 07 …`, echoing the
+bytes that were written). All of it is filtered out by opcode, address and
+checksum instead of being mistaken for an answer.
 
 ## Install
 
 ```console
-$ pip install pyusb          # only for dpi / status / battery / probe / rate device
+$ pip install .        # installs the compxctl command; there is nothing else to install
 ```
 
-That is the whole dependency list. `rate` and `--version` work with a bare
-Python 3.10+ and nothing else.
-
-Or install it as a package:
-
-```console
-$ pip install .            # CLI only, no dependencies
-$ pip install ".[device]"  # + pyusb for the device commands
-```
-
-Русский: [README.md](README.md)
+Or just copy `compxctl.py` — it runs on a bare Python 3.10+. Device commands
+need access to `/dev/hidraw*` (see Permissions); reading sysfs needs nothing.
 
 ## Usage
 
@@ -68,7 +91,7 @@ $ pip install ".[device]"  # + pyusb for the device commands
 ```console
 $ compxctl rate                 # show: device, host override, effective rate
 $ sudo compxctl rate host 1000  # host-side, all USB mice, immediate, reversible
-$ sudo compxctl rate both 1000 --persist   # also rewrite the device's EEPROM
+$ compxctl rate device 1000 --persist      # also rewrite the device's EEPROM
 ```
 
 `rate host` writes `usbhid.mousepoll`, which applies to **every USB mouse** on
@@ -84,17 +107,27 @@ The tool detects which case you are in (`usbhid_is_builtin()` reads
 machine this was developed on, `usbhid` is built in and a pre-existing
 `/etc/modprobe.d/mousepoll.conf` was doing nothing at all.
 
-`rate device HZ --persist` places two live interval packets and one EEPROM
-write, then reads the value back:
+`rate device HZ --persist` sends two live interval packets and one EEPROM write,
+reads the value back, and **resets the port itself** instead of asking you to
+crawl under the desk and re-plug the receiver:
 
 ```console
-$ compxctl rate device 1000 --persist
-Device EEPROM updated to 1000 Hz (0x01).
-  Re-plug the mouse (or replug the receiver) for the host to re-read it.
+$ compxctl rate device 500 --persist
+Device EEPROM updated to 500 Hz (0x02).
+  Port reset: the receiver re-enumerated, and the host re-read the descriptors; the endpoint advertises 1000 Hz (1ms, ep_81).
+  That is expected: on this unit the stored interval does not change the endpoint, which stays at 1ms — the stored value is what the device itself sends at.
 ```
 
-It refuses to run without `--persist`, and it skips the write entirely when the
-stored value already matches.
+It refuses to run without `--persist`, and when the stored value already matches
+it writes nothing and leaves the port alone. `--no-reset` leaves the reset to
+you: it writes the value and still reminds you to re-plug, which is what you
+want if the receiver is shared with a keyboard and you would rather it did not
+disappear.
+
+The reset is `USBDEVFS_RESET` on `/dev/bus/usb/BBB/DDD`; the kernel logs it
+(`usb 3-2: reset full-speed USB device number 2`), so it is easy to check. If
+the user has no access to that node the command does not fail: it says the port
+was not reset and suggests re-plugging.
 
 Which one do you want?
 
@@ -109,9 +142,16 @@ Which one do you want?
 ```console
 $ compxctl dpi list
   slot  addr    x    y    mul  crc   value
-  *0    0x000C  13   13   00   2F    1000
-   1    0x0010  1F   1F   00   17    1600
-   ...
+  *0   0x000C  07   07   00   47    400
+   1   0x0010  13   13   00   2F    1000
+   2   0x0014  1F   1F   00   17    1600
+   3   0x0018  2F   2F   00   F7    2400
+   4   0x001C  77   77   00   67    6000
+   5   0x0020  7F   7F   00   57    6400
+   6   0x0024  EF   EF   00   77    raw:0xEF
+   7   0x0028  7B   7B   44   1B    raw:0x7B(mul=0x44)
+Active DPI level: slot 0 (index 0x01)
+
 $ compxctl dpi 2400              # writes the active level's slot
 $ compxctl dpi --slot 3 2400     # writes an explicit slot 0..5
 ```
@@ -132,12 +172,51 @@ $ compxctl battery                      # percent, charging, link mode
 $ compxctl probe --start 0x0000 --length 0x20   # read-only config memory dump
 ```
 
+### Machine-readable output: `--json`
+
+`rate`, `status`, `dpi` and `battery` accept `--json` — exactly one JSON
+document on stdout, ready for Waybar, Polybar, i3status or a script:
+
+```console
+$ compxctl battery --json | jq -r '.battery.percent'
+95
+$ compxctl status --json | jq '{rate: .polling.effective_rate_hz, dpi: .active_dpi.dpi}'
+{
+  "rate": 1000,
+  "dpi": 400
+}
+$ compxctl status --json | jq '.dpi_slots[] | select(.active) | .text'
+"400"
+```
+
+What you can rely on:
+
+* a runtime error is **one** JSON document on stdout:
+  `{"schema": 1, "command": "status", "error": {"message": "..."}}`, with exit
+  code `1`;
+* a command-line error (exit code `2`) stays text on stderr and produces no
+  document: that is a typo in your script, not a state of the device;
+* an unknown value is `null`, never the string `"n/a"`;
+* `status` reads four things at once and does not die because of one: whatever
+  could not be read lands in the `warnings` array and the rest is still there.
+  `dpi` and `battery` read a single thing and answer with an `error` document
+  instead;
+* `schema` changes only when the meaning of a key changes; adding keys does not
+  bump it.
+
+`status --json` does not touch the kernel driver and does not disturb the mouse,
+so a status bar can call it every second — while the device answers, that is a
+few milliseconds. A device that does not answer runs into the timeout on every
+read, and then `status` can take up to ~14 s (4 reads × 4 attempts × 500 ms),
+which is worth a timeout of your own in a bar.
+
 ## Permissions
 
 * `rate` (reading) needs nothing.
 * `rate host` needs root — it writes a kernel module parameter.
-* The device commands need access to the USB device. Install the rule shipped in
-  the repository, or just run those commands with `sudo`:
+* The device commands need access to the `/dev/hidraw*` node, and `--persist`
+  also to the USB device node (the port reset). Install the rule shipped in the
+  repository, or just run those commands with `sudo`:
 
 ```console
 $ sudo cp 99-compx-mouse.rules /etc/udev/rules.d/
@@ -145,13 +224,16 @@ $ sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 ```udev
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uaccess"
 ```
 
-2.x talks to the config interface through libusb, so the `hidraw` and `input`
-rules the 1.x release needed are gone. `TAG+="uaccess"` covers an active logind
-session. Note that a `GROUP="users"` fallback is a portability trap: that group
-does not exist on Fedora or Arch, so the rule silently grants nothing there.
+`TAG+="uaccess"` covers an active logind session. The `usb_device` rule is only
+needed for the port reset: without it, `rate device --persist` still writes the
+value, skips the reset and says so. Note that a `GROUP="users"` fallback is a
+portability trap: that group does not exist on Fedora or Arch, so the rule
+silently grants nothing there. If you installed the 2.x rules, reinstall them —
+they did not cover `hidraw`.
 
 ## Supported devices
 
@@ -169,26 +251,71 @@ verified.
 | `2` | command-line error (argparse) |
 | `130` | interrupted |
 
+With `--json` a runtime error arrives as a document on stdout; the exit code is
+unchanged.
+
 ## Tests
 
 ```console
 $ pip install pytest && pytest
 ```
 
-The suite needs no hardware, no root and no pyusb: the device layer is driven
-through a fake pyusb object, and the sysfs layer through a synthetic tree. It
-also locks down two real bugs found during review of the previous version — the
-hex-vs-decimal parsing of USB descriptor attributes, and a partial DPI readback
-check that accepted a wrong `y` byte.
+185 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+packages: the device layer runs against a fake hidraw IO object, and the sysfs
+layer against a synthetic tree, hidraw node lookup included. They also pin down
+real bugs found on live hardware:
+
+* the hidraw lookup could return the motion interface's node instead of the
+  config interface's — `SET_REPORT` there fails with `EPIPE`;
+* the readback accepted a write's acknowledge as its answer, and a retried
+  command left an extra reply queued — together they made a successful EEPROM
+  write look like a failure;
+* hex-vs-decimal parsing of USB descriptor attributes, and a partial DPI
+  readback check that accepted a wrong `y` byte (from the previous review).
+
+One test reads `compxctl.py`'s AST and fails if any import outside the standard
+library appears.
+
+## What was verified on hardware
+
+All of the following was measured on an Ardor Gaming Ulta (`25a7:fa7b`), kernel
+7.2.9 — not taken from documentation:
+
+* **hidraw instead of libusb.** Config-memory, DPI and battery reads and all
+  frame writes return byte-identical answers to the old libusb path, without
+  detaching the kernel driver.
+* **The port reset works without root** (with the udev rule installed):
+  `USBDEVFS_RESET` returns `0` and the kernel logs `usb 3-2: reset full-speed
+  USB device number 2 using xhci_hcd`.
+* **The readback really does catch a failure.** In one run the 500 Hz write was
+  reported as failed, and it was right — not because the write failed, but
+  because the read had taken a reply to the previous command out of the queue.
+  With the filter fixed, write and readback agree and `probe` shows `0x01`/`0x02`
+  at `0x0000`.
+* **The descriptor does not follow the EEPROM.** With code `0x02` (500 Hz)
+  stored, the interface still advertises `bInterval = 01`, i.e. 1 ms; with `0x01`
+  it is the same. Checked on both sides of a port reset. So the old wording
+  ("re-plug the mouse so the host re-reads the descriptor") explained the effect
+  wrongly: nothing in the descriptor changes, and the stored code governs how
+  often the mouse itself sends. That last step is an inference — seeing it
+  directly would mean counting input reports while the mouse moves.
+* **A full config-memory dump taken before and after all of it is identical** —
+  the writes never touched the DPI level count (`0x0002`), the active index
+  (`0x0004`) or the slots.
 
 ## Limitations
 
 * The EEPROM path is still reverse-engineered and still wear-limited. `--persist`
-  is the only command that writes it, and it verifies by readback.
+  is the only command that writes it, and it verifies by readback and compares
+  the frame with the capture verified on hardware.
 * `rate host` cannot express "only this mouse" — `mousepoll` is global.
 * Slots 6-7 use an undecoded encoding and are never written.
-* `status`, `battery` and `probe` need `pyusb`; there is no hidraw fallback
-  because this mouse's config interface is claimed by `usbhid`.
+* The port reset drops **the whole receiver** off the bus. If the same receiver
+  also carries a keyboard, that keyboard disappears for a second — which is what
+  `--no-reset` is for.
+* The tool does not measure the rate the mouse actually reports at: that needs
+  mouse movement, and counting input events the way the removed `check` command
+  did is a way to get a wrong number.
 
 ## License
 

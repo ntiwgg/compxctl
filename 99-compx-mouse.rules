@@ -1,12 +1,20 @@
 # CompX / Ardor Gaming mice — USB vendor id 25a7.
 #
-# compxctl 2.x reaches the device's config interface through libusb (pyusb), so
-# only the usb device node is needed. It no longer touches hidraw or input
-# nodes, which is why the 1.x hidraw/input rules are gone.
+# Two rules for two different jobs:
+#
+#  * hidraw — the vendor protocol itself (dpi, battery, status, probe, and the
+#    EEPROM write behind `rate device --persist`). The config interface is a HID
+#    interface that usbhid already owns, and hidraw is how user space reaches it
+#    without detaching the kernel driver.
+#  * usb_device — the port reset that follows `rate device --persist`
+#    (USBDEVFS_RESET on /dev/bus/usb/BBB/DDD), so the receiver re-enumerates
+#    instead of asking you to crawl under the desk. Without it the reset is
+#    skipped with a warning and the command still does its job.
 #
 # TAG+="uaccess" grants access to the active logind session, so no group
 # membership is required on a normal desktop. Without logind (SSH, old
 # distros), run the device commands once with sudo instead — do not add
 # GROUP="users": that group does not exist on Fedora or Arch and the rule would
 # then silently grant nothing.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", TAG+="uaccess"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="25a7", TAG+="uaccess"

@@ -9,13 +9,29 @@ Two mechanisms, deliberately kept apart because they are not equivalent:
   it answers "what rate am I actually polling at" exactly — no event counting,
   no mouse movement.
 * **Device settings** — DPI, and (only on explicit request) the interval the
-  device advertises after a re-plug. These live inside the chip, so they still
-  need the reverse-engineered vendor protocol over raw USB (pyusb).
+  device keeps for itself. These live inside the chip, so they still need the
+  reverse-engineered vendor protocol, but no longer a third-party library to
+  carry it.
 
-That split is the whole point of this rewrite. The previous version changed the
-polling rate by writing the vendor EEPROM by default, which is the most
-dangerous and least portable way to do it: irreversible, wear-limited, and
-reverse engineered from a single unit.
+The whole tool is standard library only. The device commands reach the config
+interface through `/dev/hidraw*` rather than through libusb: that interface is
+a HID interface, `usbhid` already owns it, and the kernel offers it to user
+space as a hidraw node. Feature reports go out with one `fcntl.ioctl`, replies
+come back as input reports, and no kernel driver is ever detached — which is
+why `status` no longer makes the pointer stutter the way the libusb version
+did.
+
+That works because of what the device itself declares. Its report descriptor
+for the config interface (189 bytes, read from the verified unit) contains:
+
+* report id 6, FEATURE, 7 bytes — the first live interval packet;
+* report id 8, FEATURE, 16 bytes — config-memory read/write, battery request;
+* report id 9, INPUT, 16 bytes — every reply the firmware sends.
+
+So SET_REPORT(FEATURE) is the framing the descriptor asks for, and the answer
+has to be taken from the input queue: GET_REPORT (`HIDIOCGFEATURE`) on this
+firmware returns 17 zero bytes, so a read is a feature-report write followed by
+an input-report read, never a plain feature read.
 
 The vendor protocol tables below are kept from the previous version because
 they were verified on hardware; the framing is unchanged.
@@ -24,30 +40,106 @@ they were verified on hardware; the framing is unchanged.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import errno
+import fcntl
+import json
 import os
 import re
+import select
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence, TypeVar
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
+
+# Version of the `--json` documents. Bump it when a key changes meaning or
+# disappears; adding a key does not bump it.
+JSON_SCHEMA = 1
+
+# What a device readout returns; `_attempt` keeps that type when it swallows a
+# failed read into a warning.
+ResultT = TypeVar("ResultT")
 
 VENDOR_ID = 0x25A7
 PRODUCT_IDS = (0xFA7B, 0xFA7C, 0xFA03, 0xFA93)
 
 SYSFS_USB_ROOT = Path("/sys/bus/usb/devices")
+SYSFS_HIDRAW_ROOT = Path("/sys/class/hidraw")
+DEV_ROOT = Path("/dev")
+USBFS_ROOT = Path("/dev/bus/usb")
 MOUSEPOLL_PATH = Path("/sys/module/usbhid/parameters/mousepoll")
 
 # HID boot-mouse interface: bInterfaceClass 0x03, SubClass 0x01, Protocol 0x02.
 # That is the interface the host polls for motion, so its interrupt-IN interval
-# is the polling interval a user means. The config interface is 0x03/0x01/0x01.
+# is the polling interval a user means.
 MOUSE_INTERFACE_CLASS = (0x03, 0x01, 0x02)
+
+# The config interface of the verified unit: same HID class, but boot-keyboard
+# protocol 0x01. It carries the vendor report ids 6/8/9, so its hidraw node is
+# the one the reverse-engineered protocol talks to.
+CONFIG_INTERFACE_CLASS = (0x03, 0x01, 0x01)
+
+# Reply frames are input report 9 (see the module docstring), and the largest
+# report on that interface is 17 bytes. Reading more than one report's worth is
+# deliberate: a surprise longer report is then skipped instead of truncated
+# into something that looks like a frame.
+COMPX_REPLY_REPORT_ID = 0x09
+HIDRAW_READ_BYTES = 64
+
+# Ceiling on the frames thrown away before a command goes out. The queue holds
+# acknowledgements of earlier commands, not a stream, so this is a guard against
+# a device that never stops talking rather than a working limit.
+HIDRAW_DRAIN_MAX_FRAMES = 64
 
 # One host interval per supported rate, in milliseconds. mousepoll takes ms.
 HOST_INTERVAL_MS_BY_RATE: dict[int, int] = {1000: 1, 500: 2, 125: 8}
+
+# How long to wait for the device to re-appear after a port reset, and how
+# often to look. The kernel re-enumerates synchronously inside the reset ioctl,
+# so this is slack for driver rebinding, not for the reset itself.
+RESET_TIMEOUT_S = 5.0
+RESET_POLL_S = 0.1
+
+
+# --------------------------------------------------------------------------
+# ioctl numbers, written the way <sys/ioctl.h> computes them. The test suite
+# pins them against values compiled from the kernel headers, because a wrong
+# number here fails silently (the ioctl simply does something else).
+# --------------------------------------------------------------------------
+
+_IOC_NRBITS = 8
+_IOC_TYPEBITS = 8
+_IOC_SIZEBITS = 14
+_IOC_NRSHIFT = 0
+_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS
+_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS
+_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS
+_IOC_WRITE = 1
+_IOC_READ = 2
+
+
+def _ioc(direction: int, kind: str, number: int, size: int) -> int:
+    """The `_IOC()` macro from `<sys/ioctl.h>`."""
+    return (
+        (direction << _IOC_DIRSHIFT)
+        | (ord(kind) << _IOC_TYPESHIFT)
+        | (number << _IOC_NRSHIFT)
+        | (size << _IOC_SIZESHIFT)
+    )
+
+
+def hidraw_set_feature_ioctl(size: int) -> int:
+    """`HIDIOCSFEATURE(size)`: SET_REPORT of a feature report, control transfer.
+
+    The buffer carries the report number in its first byte, which is exactly how
+    the vendor frames are laid out — their first byte is the report id.
+    """
+    return _ioc(_IOC_WRITE | _IOC_READ, "H", 0x06, size)
+
+
+# `USBDEVFS_RESET`: re-enumerate one device, the programmatic re-plug.
+usbdevfs_reset_ioctl = _ioc(0, "U", 20, 0)
 
 
 # ==========================================================================
@@ -156,6 +248,8 @@ class Mouse:
     name: str
     speed_mbps: float | None
     interface_dir: Path | None
+    config_interface_dir: Path | None
+    hidraw_path: Path | None
     endpoint: MouseEndpoint | None
 
     @property
@@ -165,6 +259,76 @@ class Mouse:
     @property
     def display_name(self) -> str:
         return self.name or f"CompX mouse {self.vendor:04x}:{self.product:04x}"
+
+
+InterfaceClasses = tuple[int | None, int | None, int | None]
+
+
+def pick_interfaces(
+    candidates: Sequence[tuple[Path, InterfaceClasses]],
+) -> tuple[Path | None, Path | None]:
+    """Split a device's HID interfaces into (motion interface, config interface).
+
+    Both are HID interfaces (class 0x03) and they are told apart by
+    bInterfaceProtocol: 0x02 is the boot mouse, the interface whose interrupt-IN
+    interval the host polls and the user means by "polling rate"; 0x01 is the
+    config interface that carries the vendor report ids. A device that exposes
+    only one HID interface gets that one for both roles.
+    """
+    first_hid = next((directory for directory, classes in candidates if classes[0] == 0x03), None)
+    return (
+        next((d for d, c in candidates if c == MOUSE_INTERFACE_CLASS), None) or first_hid,
+        next((d for d, c in candidates if c == CONFIG_INTERFACE_CLASS), None) or first_hid,
+    )
+
+
+def hidraw_node_for(
+    interface_dirs: Sequence[Path | None], root: Path = SYSFS_HIDRAW_ROOT
+) -> Path | None:
+    """The `/dev/hidrawN` node of the first interface that has one.
+
+    `/sys/class/hidraw/hidrawN/device` points at the HID device whose parent is
+    the USB interface directory, so the mapping is by ancestry and not by node
+    number — numbers are reused and must not be cached across a re-enumeration.
+
+    The order of `interface_dirs` is the preference order and it is checked
+    outermost: a device has one hidraw node per HID interface, the motion
+    interface is usually the lower-numbered node, and a feature report sent to
+    it fails with EPIPE because the vendor report ids live on the config
+    interface only.
+    """
+    nodes = [(entry.name, (entry / "device").resolve()) for entry in sorted(root.glob("hidraw*"))]
+    for directory in interface_dirs:
+        if directory is None:
+            continue
+        resolved = directory.resolve()
+        for name, device in nodes:
+            if resolved in device.parents:
+                return DEV_ROOT / name
+    return None
+
+
+def _interface_candidates(device_dir: Path, root: Path) -> list[tuple[Path, InterfaceClasses]]:
+    """Every interface of one device with its class triple, in sysfs order."""
+    return [
+        (
+            candidate,
+            (
+                _read_hex(candidate / "bInterfaceClass"),
+                _read_hex(candidate / "bInterfaceSubClass"),
+                _read_hex(candidate / "bInterfaceProtocol"),
+            ),
+        )
+        for candidate in sorted(root.glob(f"{device_dir.name}:*"))
+    ]
+
+
+def _speed_mbps(device_dir: Path) -> float | None:
+    raw = _read_text(device_dir / "speed")
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
 
 
 def _mouse_endpoint(interface_dir: Path, speed_mbps: float | None) -> MouseEndpoint | None:
@@ -201,56 +365,37 @@ def _mouse_endpoint(interface_dir: Path, speed_mbps: float | None) -> MouseEndpo
     )
 
 
-def find_mouses(root: Path = SYSFS_USB_ROOT) -> list[Mouse]:
+def find_mouses(
+    root: Path = SYSFS_USB_ROOT, hidraw_root: Path = SYSFS_HIDRAW_ROOT
+) -> list[Mouse]:
     """Every supported mouse currently on the USB bus, from sysfs alone."""
-    found: list[Mouse] = []
     try:
         entries = sorted(root.iterdir())
     except OSError:
-        return found
+        return []
 
-    for device_dir in entries:
-        vendor = _read_hex(device_dir / "idVendor")
-        product = _read_hex(device_dir / "idProduct")
-        if vendor != VENDOR_ID or product not in PRODUCT_IDS:
-            continue
+    return [
+        _mouse_from_device(device_dir, root, hidraw_root)
+        for device_dir in entries
+        if _read_hex(device_dir / "idVendor") == VENDOR_ID
+        and _read_hex(device_dir / "idProduct") in PRODUCT_IDS
+    ]
 
-        speed_raw = _read_text(device_dir / "speed")
-        try:
-            speed_mbps = float(speed_raw) if speed_raw else None
-        except ValueError:
-            speed_mbps = None
 
-        interface_dir = None
-        fallback_dir = None
-        for candidate in sorted(root.glob(f"{device_dir.name}:*")):
-            triple = (
-                _read_hex(candidate / "bInterfaceClass"),
-                _read_hex(candidate / "bInterfaceSubClass"),
-                _read_hex(candidate / "bInterfaceProtocol"),
-            )
-            if triple == MOUSE_INTERFACE_CLASS:
-                interface_dir = candidate
-                break
-            if fallback_dir is None and triple[0] == 0x03:
-                fallback_dir = candidate
-        if interface_dir is None:
-            interface_dir = fallback_dir
-
-        found.append(
-            Mouse(
-                sysfs_dir=device_dir,
-                vendor=vendor,
-                product=product,
-                name=_read_text(device_dir / "product") or "",
-                speed_mbps=speed_mbps,
-                interface_dir=interface_dir,
-                endpoint=_mouse_endpoint(interface_dir, speed_mbps)
-                if interface_dir is not None
-                else None,
-            )
-        )
-    return found
+def _mouse_from_device(device_dir: Path, root: Path, hidraw_root: Path) -> Mouse:
+    speed_mbps = _speed_mbps(device_dir)
+    motion_dir, config_dir = pick_interfaces(_interface_candidates(device_dir, root))
+    return Mouse(
+        sysfs_dir=device_dir,
+        vendor=VENDOR_ID,
+        product=_read_hex(device_dir / "idProduct") or 0,
+        name=_read_text(device_dir / "product") or "",
+        speed_mbps=speed_mbps,
+        interface_dir=motion_dir,
+        config_interface_dir=config_dir,
+        hidraw_path=hidraw_node_for((config_dir, motion_dir), hidraw_root),
+        endpoint=_mouse_endpoint(motion_dir, speed_mbps) if motion_dir is not None else None,
+    )
 
 
 def read_mousepoll(path: Path | None = None) -> int | None:
@@ -343,7 +488,6 @@ DPI_SLOT_BYTES = 4
 DPI_WRITE_SLOT_MAX = 5  # slots 6-7 use an undecoded extended encoding
 EMPTY_SLOT = b"\xff\xff\xff\xff"
 PROBE_BLOCK_BYTES = 8
-PROBE_MAX_DUMP_BYTES = 0x100
 CONFIG_MEMORY_BYTES = 0x10000
 READ_ATTEMPTS = 4
 READ_TIMEOUT_MS = 500
@@ -394,8 +538,11 @@ def build_write_frame(addr: int, data: bytes) -> bytes:
     """17-byte config-memory write: 08 07 00 AH AL LN + data + pad + checksum."""
     if not 1 <= len(data) <= MAX_PAYLOAD_BYTES:
         raise ValueError(f"payload must be 1..{MAX_PAYLOAD_BYTES} bytes, got {len(data)}")
-    if not 0 <= addr < CONFIG_MEMORY_BYTES:
-        raise ValueError(f"address 0x{addr:X} is outside the config memory window")
+    if not 0 <= addr or addr + len(data) > CONFIG_MEMORY_BYTES:
+        raise ValueError(
+            f"write window 0x{addr:04X}+{len(data)} is outside the config memory "
+            f"(0x0000..0x{CONFIG_MEMORY_BYTES - 1:04X})"
+        )
     body = (
         b"\x08\x07\x00"
         + bytes(((addr >> 8) & 0xFF, addr & 0xFF, len(data)))
@@ -426,7 +573,7 @@ def build_battery_request() -> bytes:
     body = b"\x08\x04" + b"\x00" * (COMPX_FRAME_BYTES - 3)
     request = body + bytes((compx_checksum(body),))
     if request != _KNOWN_GOOD_BATTERY_REQUEST:
-        raise AssertionError(
+        raise RuntimeError(
             f"battery request drift: built {request.hex(' ')} != known-good "
             f"{_KNOWN_GOOD_BATTERY_REQUEST.hex(' ')}"
         )
@@ -454,7 +601,7 @@ def eeprom_packet(rate: int) -> bytes:
     packet = build_write_frame(CONFIG_ADDR_POLLING, bytes((code, 0x55 - code)))
     known_good = _KNOWN_GOOD_EEPROM_PACKETS[rate]
     if packet != known_good:
-        raise AssertionError(
+        raise RuntimeError(
             f"EEPROM packet drift for {rate} Hz: built {packet.hex(' ')} "
             f"!= known-good {known_good.hex(' ')}"
         )
@@ -490,133 +637,158 @@ def dpi_slot_addr(slot: int) -> int:
 
 
 # ==========================================================================
-# Raw-USB transport (pyusb) — one claimed session per command, so a command
-# pays the kernel-driver detach/re-attach once instead of once per transfer.
+# hidraw transport — the config interface through /dev/hidrawN. Standard
+# library only, one ioctl per frame, and usbhid keeps the interface: nothing is
+# detached, nothing is claimed, and no third-party package is involved.
 # ==========================================================================
 
 
-def _pyusb():
-    try:
-        import usb.core
-        import usb.util
-    except ImportError as exc:
-        raise RuntimeError(
-            "The `usb` package (pyusb) is missing — it is required for the "
-            "device commands (dpi, status, battery, probe, rate device). "
-            "Install it with: pip install pyusb"
-        ) from exc
-    return usb.core, usb.util
+class HidrawIO:
+    """The syscalls the protocol needs, isolated so tests can replace them."""
+
+    @staticmethod
+    def open(path: Path) -> int:
+        return os.open(path, os.O_RDWR)
+
+    @staticmethod
+    def set_feature(fd: int, frame: bytes) -> None:
+        """SET_REPORT(feature) of `frame`; its first byte is the report number."""
+        buffer = bytearray(frame)
+        fcntl.ioctl(fd, hidraw_set_feature_ioctl(len(frame)), buffer, True)
+
+    @staticmethod
+    def read_report(fd: int, timeout_ms: int) -> bytes | None:
+        """The next input report, or None when the timeout runs out."""
+        ready, _, _ = select.select([fd], [], [], timeout_ms / 1000.0)
+        return bytes(os.read(fd, HIDRAW_READ_BYTES)) if ready else None
+
+    @staticmethod
+    def close(fd: int) -> None:
+        os.close(fd)
 
 
-class UsbSession:
-    """The CompX config interface (interface 1), claimed for one command."""
+def is_config_reply(report: bytes) -> bool:
+    """Whether an input report can be an answer to a config command.
 
-    def __init__(self, timeout_ms: int = READ_TIMEOUT_MS) -> None:
+    The config interface carries traffic of its own — report ids 1, 2, 3 and 5,
+    plus the 0x11 acknowledge of a live interval packet — and none of it may be
+    mistaken for a reply. A reply is input report 9 and 17 bytes long.
+    """
+    return len(report) == COMPX_FRAME_BYTES and report[0] == COMPX_REPLY_REPORT_ID
+
+
+class HidrawSession:
+    """The CompX config interface, open for the duration of one command."""
+
+    def __init__(
+        self,
+        mouse: Mouse | None = None,
+        *,
+        timeout_ms: int = READ_TIMEOUT_MS,
+        io: type[HidrawIO] = HidrawIO,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._mouse = mouse
         self.timeout_ms = timeout_ms
-        self._device = None
-        self._usb_core = None
-        self._usb_util = None
-        self._detached = False
+        self._io = io
+        self._clock = clock
+        self._fd: int | None = None
 
-    def __enter__(self) -> "UsbSession":
-        usb_core, usb_util = _pyusb()
-        self._usb_core, self._usb_util = usb_core, usb_util
+    @property
+    def mouse(self) -> Mouse:
+        """The device this session talks to; found once, then remembered."""
+        if self._mouse is None:
+            self._mouse = _require_mouse()
+        return self._mouse
 
-        device = None
-        for product_id in PRODUCT_IDS:
-            device = usb_core.find(idVendor=VENDOR_ID, idProduct=product_id)
-            if device is not None:
-                break
-        if device is None:
-            raise RuntimeError(
-                "No CompX mouse found (VID 0x25A7). Check the USB connection: "
-                "lsusb -d 25a7:"
-            )
+    def __enter__(self) -> "HidrawSession":
+        path = require_hidraw_path(self.mouse)
         try:
-            if device.is_kernel_driver_active(1):
-                device.detach_kernel_driver(1)
-                self._detached = True
-            usb_util.claim_interface(device, 1)
-        except usb_core.USBError as exc:
+            self._fd = self._io.open(path)
+        except PermissionError as exc:
             raise RuntimeError(
-                f"Cannot claim the CompX config interface (interface 1): {exc}. "
-                "Install the udev rules or run once with sudo."
+                f"No permission to open {path}. The device commands need access "
+                'to the hidraw node: install 99-compx-mouse.rules (TAG+="uaccess") '
+                "or run once with sudo."
             ) from exc
-        self._device = device
+        except OSError as exc:
+            raise RuntimeError(f"Cannot open {path}: {exc}") from exc
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        device = self._device
-        if device is None:
-            return
-        try:
-            self._usb_util.release_interface(device, 1)
-        except self._usb_core.USBError:
-            pass
-        if self._detached:
-            with contextlib.suppress(self._usb_core.USBError):
-                device.attach_kernel_driver(1)
-        self._usb_util.dispose_resources(device)
-        self._device = None
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            self._io.close(fd)
 
     # -- transfers ---------------------------------------------------------
 
-    def send(self, packet: bytes, report_type: int = 0x02) -> None:
-        """SET_REPORT to interface 1. 0x02 = output report, 0x03 = feature."""
-        assert self._device is not None
+    def send(self, packet: bytes) -> None:
+        """One vendor frame out, as a feature report addressed by packet[0]."""
+        fd = self._open_fd()
         try:
-            sent = self._device.ctrl_transfer(
-                bmRequestType=0x21,
-                bRequest=9,  # SET_REPORT
-                wValue=(report_type << 8) | packet[0],
-                wIndex=1,
-                data_or_wLength=packet,
-                timeout=1000,
-            )
-        except self._usb_core.USBError as exc:
-            raise OSError(str(exc)) from exc
-        if sent != len(packet):
-            raise OSError("USB SET_REPORT rejected by the device")
+            self._io.set_feature(fd, packet)
+        except OSError as exc:
+            raise OSError(f"SET_REPORT of {packet[:3].hex(' ')} was rejected: {exc}") from exc
 
-    def _interrupt_in_endpoint(self):
-        assert self._device is not None
-        configuration = self._device.get_active_configuration()
-        try:
-            interface = configuration[(1, 0)]
-        except KeyError as exc:
-            raise RuntimeError(
-                "The CompX config interface (interface 1) is not in the active "
-                "USB configuration"
-            ) from exc
-        endpoint = self._usb_util.find_descriptor(
-            interface,
-            custom_match=lambda ep: (
-                self._usb_util.endpoint_direction(ep.bEndpointAddress)
-                == self._usb_util.ENDPOINT_IN
-                and self._usb_util.endpoint_type(ep.bmAttributes)
-                == self._usb_util.ENDPOINT_TYPE_INTR
-            ),
-        )
-        if endpoint is None:
-            raise RuntimeError(
-                "No interrupt-IN endpoint on the CompX config interface"
-            )
-        return endpoint
+    def _drain_pending(self) -> int:
+        """Throw away whatever is already queued, without waiting for more.
 
-    def read_reply(self) -> bytes | None:
-        """One frame from interrupt-IN, or None on timeout (never retried)."""
-        assert self._device is not None
-        endpoint = self._interrupt_in_endpoint()
-        try:
-            return bytes(
-                self._device.read(
-                    endpoint.bEndpointAddress, COMPX_FRAME_BYTES, timeout=self.timeout_ms
-                )
-            )
-        except self._usb_core.USBError as exc:
-            if exc.errno == errno.ETIMEDOUT:
-                return None
-            raise OSError(str(exc)) from exc
+        Called before every command: a reply to an earlier read of the same
+        register passes the same header and checksum checks as a fresh one, so
+        nothing stale may be left in front of the answer being asked for.
+
+        The loop ends on the first read that brings nothing back — a short read
+        included, which is falsy — and in any case after HIDRAW_DRAIN_MAX_FRAMES,
+        so neither a closed pipe nor a device that streams faster than this
+        drains can hold a command here.
+        """
+        fd = self._open_fd()
+        drained = 0
+        while drained < HIDRAW_DRAIN_MAX_FRAMES:
+            report = self._io.read_report(fd, 0)
+            if not report:
+                break
+            drained += 1
+        return drained
+
+    def _open_fd(self) -> int:
+        """The descriptor, or a sentence instead of an AssertionError.
+
+        Every transfer goes through here: using a session outside its `with`
+        block is a programming error, and it should read like one — and stay an
+        error under `python -O`, where `assert` disappears.
+        """
+        if self._fd is None:
+            raise RuntimeError("The hidraw session is not open; use it as a context manager.")
+        return self._fd
+
+    def _await_reply(self, reject: Callable[[bytes], str | None]) -> tuple[bytes | None, str | None]:
+        """Drain input reports until one passes `reject` or the deadline passes.
+
+        Returns (frame, why the last frame was refused). Draining instead of
+        giving up on the first foreign frame is what keeps the queue clean: the
+        firmware sends frames of its own — one acknowledge per live interval
+        packet and per config write — and a command sent again while those are
+        in flight leaves an extra reply behind, which the *next* command then
+        reads as its answer. That is exactly how a readback after an EEPROM
+        write ends up reporting the value from before the write.
+        """
+        fd = self._open_fd()
+        deadline = self._clock() + self.timeout_ms / 1000.0
+        detail: str | None = None
+        while True:
+            remaining_ms = round((deadline - self._clock()) * 1000)
+            if remaining_ms <= 0:
+                return None, detail
+            report = self._io.read_report(fd, remaining_ms)
+            if report is None:
+                return None, detail
+            if not is_config_reply(report):
+                continue
+            reason = reject(report)
+            if reason is None:
+                return report, None
+            detail = reason
 
     # -- request/response --------------------------------------------------
 
@@ -624,31 +796,30 @@ class UsbSession:
         self,
         packet: bytes,
         *,
-        report_type: int = 0x02,
         reject: Callable[[bytes], str | None],
         parse: Callable[[bytes], object],
         timeout_message: str,
     ) -> object:
-        """Send `packet`, then take the matching reply off interrupt-IN.
+        """Send `packet`, then take the matching reply out of the input queue.
 
-        A frame that fails `reject` is a stale queued frame (the firmware acks
-        writes on the same endpoint) and is drained by this read, so the
-        command is retried. A timeout is not retried: a late reply must not be
-        doubled.
+        Anything already queued is dropped first, frames that fail `reject` are
+        drained rather than counted as a reply, and the command is sent again
+        only when nothing matched at all — a lost answer over the radio link,
+        not a foreign frame. A reply to an earlier command cannot be told from a
+        fresh one by its header alone, so the fewer commands in flight, the
+        fewer chances to read the wrong answer.
         """
         detail = timeout_message
         for _ in range(READ_ATTEMPTS):
-            self.send(packet, report_type=report_type)
-            reply = self.read_reply()
-            if reply is None:
-                raise RuntimeError(timeout_message)
-            reason = reject(reply)
-            if reason is None:
+            self._drain_pending()
+            self.send(packet)
+            reply, reason = self._await_reply(reject)
+            if reply is not None:
                 return parse(reply)
-            detail = reason
+            detail = reason or timeout_message
         raise RuntimeError(
-            f"{detail} (retried {READ_ATTEMPTS} times after stale frames; "
-            "is another program talking to the mouse?)"
+            f"{detail} (tried {READ_ATTEMPTS} times; is another program "
+            "talking to the mouse?)"
         )
 
     # -- config memory -----------------------------------------------------
@@ -660,10 +831,16 @@ class UsbSession:
         def reject(reply: bytes) -> str | None:
             if len(reply) != COMPX_FRAME_BYTES:
                 return f"short reply for {register}: {len(reply)} bytes"
-            if reply[3:6] != command[3:6]:
+            # The opcode is part of the match, not just the address. A config
+            # write is acknowledged by the firmware with an input report of its
+            # own (09 07 ...) that echoes the bytes just written — same address
+            # and same length as the readback that follows, so matching on the
+            # address alone would accept that echo as the readback and "verify" a
+            # write the device had actually refused.
+            if reply[1:6] != command[1:6]:
                 return (
                     f"reply header mismatch for {register}: got "
-                    f"{reply[3:6].hex(' ')}, expected {command[3:6].hex(' ')}"
+                    f"{reply[1:6].hex(' ')}, expected {command[1:6].hex(' ')}"
                 )
             if not verify_frame(reply):
                 return f"reply checksum mismatch for {register}"
@@ -671,11 +848,11 @@ class UsbSession:
 
         return self.request(
             command,
-            report_type=0x03,
             reject=reject,
             parse=parse_read_reply,
             timeout_message=(
-                f"No config-memory reply for {register} (interrupt-IN timed out)"
+                f"No config-memory reply for {register} (no input report within "
+                f"{self.timeout_ms} ms per attempt)"
             ),
         )
 
@@ -754,36 +931,138 @@ class UsbSession:
             )
 
     def persist_rate(self, rate: int) -> bool:
-        """Write the device's stored interval to EEPROM. False if already set."""
+        """Write the device's stored interval to EEPROM. False if already set.
+
+        The readback is a plain read of 0x0000 and the protocol has no sequence
+        number, so a duplicate of the read taken *before* the write would be
+        indistinguishable from the answer to the one after it. What that can
+        cost is a loud readback-mismatch on a write that worked — never a silent
+        wrong value — which is why the command verifies the frame before sending
+        it and refuses to report success without this read.
+        """
         code = DEVICE_INTERVAL_CODE_BY_RATE[rate]
-        current = self.read(CONFIG_ADDR_POLLING, 2)
-        if current[0] == code:
-            return False
         payload = bytes((code, 0x55 - code))
+        if self.read(CONFIG_ADDR_POLLING, 2) == payload:
+            # Both bytes, not just the code: a pair that no longer satisfies the
+            # 0x55 checksum is worth rewriting, and matching on the code alone
+            # would leave a corrupt complement in the EEPROM forever.
+            return False
         # The only call in the program that writes to the mouse's EEPROM, over
         # a reverse-engineered frame. Refuse to send anything that is not
         # byte-identical to the capture verified on hardware: a wrong frame
         # here is exactly what once clobbered the DPI-level fields at
         # 0x0002..0x0005 and broke the mouse's DPI button.
         if build_write_frame(CONFIG_ADDR_POLLING, payload) != eeprom_packet(rate):
-            raise AssertionError(
+            raise RuntimeError(
                 f"refusing to write an EEPROM frame for {rate} Hz that does not "
                 "match the verified capture"
             )
         self.write(CONFIG_ADDR_POLLING, payload)
         back = self.read(CONFIG_ADDR_POLLING, 2)
-        if back[0] != code:
+        if back != payload:
             raise RuntimeError(
-                f"EEPROM readback mismatch at 0x0000: wrote 0x{code:02X}, "
-                f"read 0x{back[0]:02X}"
+                f"EEPROM readback mismatch at 0x0000: wrote {payload.hex(' ')}, "
+                f"read {back.hex(' ')}"
             )
         return True
 
 
-def apply_live_rate(session: UsbSession, rate: int) -> None:
+def apply_live_rate(session: HidrawSession, rate: int) -> None:
     """Send the two live interval packets (no EEPROM write)."""
     for packet in LIVE_PACKETS[rate]:
         session.send(packet)
+
+
+# ==========================================================================
+# Re-enumeration — `USBDEVFS_RESET` on the usbfs node. The host re-reads the
+# descriptors without anyone crawling under the desk to re-plug a receiver,
+# which is the step `rate device --persist` used to ask for.
+# ==========================================================================
+
+
+class UsbfsIO:
+    """The syscalls a port reset needs, isolated so tests can replace them."""
+
+    @staticmethod
+    def open(path: Path) -> int:
+        return os.open(path, os.O_RDWR)
+
+    @staticmethod
+    def reset(fd: int) -> None:
+        fcntl.ioctl(fd, usbdevfs_reset_ioctl, 0)
+
+    @staticmethod
+    def close(fd: int) -> None:
+        os.close(fd)
+
+
+def usbfs_node(mouse: Mouse, root: Path = USBFS_ROOT) -> Path | None:
+    """`/dev/bus/usb/BBB/DDD` for a device, from the numbers sysfs reports."""
+    bus = _read_int(mouse.sysfs_dir / "busnum")
+    devnum = _read_int(mouse.sysfs_dir / "devnum")
+    if bus is None or devnum is None:
+        return None
+    return root / f"{bus:03d}" / f"{devnum:03d}"
+
+
+def reset_usb_device(mouse: Mouse, *, io: type[UsbfsIO] = UsbfsIO, root: Path = USBFS_ROOT) -> Path:
+    """Re-enumerate the device and return the node that was reset.
+
+    The reset itself needs no root on a desktop: the uaccess tag in the udev
+    rule covers the usbfs node, which is why this stays a normal-user operation
+    like the rest of the tool.
+    """
+    node = usbfs_node(mouse, root)
+    if node is None:
+        raise RuntimeError(
+            f"{mouse.sysfs_dir} does not report busnum/devnum, so there is no "
+            "usbfs node to reset"
+        )
+    try:
+        fd = io.open(node)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"No permission to reset {node}. Install 99-compx-mouse.rules, or "
+            "re-plug the mouse by hand."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Cannot open {node}: {exc}") from exc
+    try:
+        io.reset(fd)
+    except OSError as exc:
+        raise RuntimeError(f"Reset of {node} failed: {exc}") from exc
+    finally:
+        io.close(fd)
+    return node
+
+
+def wait_for_mouse(
+    sysfs_name: str,
+    *,
+    timeout_s: float = RESET_TIMEOUT_S,
+    poll_s: float = RESET_POLL_S,
+    root: Path = SYSFS_USB_ROOT,
+    hidraw_root: Path = SYSFS_HIDRAW_ROOT,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> Mouse | None:
+    """Wait until the device is back after a reset.
+
+    Returns as soon as it is listed again with a known interval. None means it
+    did not come back in time — the caller says so rather than pretending the
+    reset worked.
+    """
+    deadline = clock() + timeout_s
+    while True:
+        mouse = next(
+            (m for m in find_mouses(root, hidraw_root) if m.sysfs_dir.name == sysfs_name),
+            None,
+        )
+        if mouse is not None and mouse.endpoint is not None:
+            return mouse
+        if clock() >= deadline:
+            return mouse
+        sleep(poll_s)
 
 
 # ==========================================================================
@@ -809,15 +1088,120 @@ def _battery_text(percent: int, charging: bool, state: int) -> str:
     return text + (f" [{label}]" if label else "")
 
 
+# ==========================================================================
+# Reports — pure translations of what was read, for a person or for a status
+# bar. `--json` prints exactly one document on stdout, errors included, so a
+# consumer can always parse what it gets; unknown values are null, never text.
+# ==========================================================================
+
+
+def document(command: str, **fields: object) -> dict:
+    return {"schema": JSON_SCHEMA, "command": command, **fields}
+
+
+def print_json(payload: dict) -> None:
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def device_json(mouse: Mouse) -> dict:
+    return {
+        "name": mouse.display_name,
+        "vendor": f"{mouse.vendor:04x}",
+        "product": f"{mouse.product:04x}",
+        "sysfs": mouse.sysfs_dir.name,
+        "hidraw": str(mouse.hidraw_path) if mouse.hidraw_path else None,
+    }
+
+
+def polling_json(mouse: Mouse | None, mousepoll_ms: int | None) -> dict:
+    """The rate picture, with null for anything that is not known right now.
+
+    `mouse` is None when the device is not on the bus (for instance straight
+    after a reset that it has not returned from yet), and then every value that
+    would have to be read from it is null rather than remembered.
+    """
+    endpoint = mouse.endpoint if mouse else None
+    hz, source = effective_rate_hz(mouse, mousepoll_ms)
+    return {
+        "advertised_rate_hz": mouse.rate_hz if mouse else None,
+        "advertised_interval_ms": endpoint.interval_ms if endpoint else None,
+        "advertised_interval_raw": endpoint.interval_raw if endpoint else None,
+        "advertised_interval_source": endpoint.interval_source if endpoint else None,
+        "endpoint": endpoint.name if endpoint else None,
+        "host_override_interval_ms": mousepoll_ms,
+        "host_override_rate_hz": (
+            rate_hz_from_interval_ms(float(mousepoll_ms)) if mousepoll_ms else None
+        ),
+        "effective_rate_hz": hz,
+        "effective_source": source,
+    }
+
+
+def battery_json(percent: int, charging: bool, state: int) -> dict:
+    return {
+        "percent": percent,
+        "charging": charging,
+        "state": state,
+        "state_label": BATTERY_STATE_LABELS.get(state),
+    }
+
+
+def slot_json(slot: dict, active_slot: int | None) -> dict:
+    return {
+        "index": slot["index"],
+        "addr": f"0x{slot['addr']:04X}",
+        "dpi": slot["dpi"],
+        "text": _slot_text(slot),
+        "empty": bytes((slot["x"], slot["y"], slot["mul"], slot["crc"])) == EMPTY_SLOT,
+        "checksum_ok": slot["crc_ok"],
+        "active": slot["index"] == active_slot,
+        "bytes": bytes((slot["x"], slot["y"], slot["mul"], slot["crc"])).hex(" "),
+        "raw": {"x": slot["x"], "y": slot["y"], "mul": slot["mul"], "crc": slot["crc"]},
+    }
+
+
+def active_dpi_json(active: tuple[int, int] | None, slots: list[dict]) -> dict:
+    slot = active_slot_for_index(active[0]) if active else None
+    known = slot is not None and slot < len(slots)
+    return {
+        "index": active[0] if active else None,
+        "slot": slot,
+        "dpi": slots[slot]["dpi"] if known else None,
+    }
+
+
+def no_mouse_message() -> str:
+    return (
+        "No CompX mouse found on the USB bus (VID 0x25A7, PIDs "
+        f"{', '.join(f'0x{p:04X}' for p in PRODUCT_IDS)}). "
+        "Check the connection: lsusb -d 25a7:"
+    )
+
+
 def _require_mouse() -> Mouse:
     mouses = find_mouses()
     if not mouses:
-        raise RuntimeError(
-            "No CompX mouse found on the USB bus (VID 0x25A7, PIDs "
-            f"{', '.join(f'0x{p:04X}' for p in PRODUCT_IDS)}). "
-            "Check the connection: lsusb -d 25a7:"
-        )
+        raise RuntimeError(no_mouse_message())
     return mouses[0]
+
+
+def require_hidraw_path(mouse: Mouse | None = None) -> Path:
+    """The hidraw node the vendor protocol talks to, or a reason why not."""
+    device = mouse or _require_mouse()
+    if device.hidraw_path is None:
+        interface = device.config_interface_dir
+        raise RuntimeError(
+            f"{device.display_name}: its config interface "
+            f"({interface.name if interface else 'not found'}) has no /dev/hidraw "
+            "node, so the vendor protocol cannot be reached. Check that hidraw is "
+            "enabled in the kernel (CONFIG_HIDRAW) and bound by usbhid."
+        )
+    return device.hidraw_path
+
+
+def _fresh_mouse(sysfs_name: str) -> Mouse | None:
+    """The same device as sysfs sees it now — its node and interval may differ."""
+    return next((m for m in find_mouses() if m.sysfs_dir.name == sysfs_name), None)
 
 
 def _describe_rate(mouse: Mouse, mousepoll_ms: int | None) -> list[str]:
@@ -849,88 +1233,281 @@ def cmd_rate(args: argparse.Namespace) -> int:
     """Show the polling rate, or change it on the host and/or the device."""
     mouse = _require_mouse()
     target = getattr(args, "target", None)
+    as_json = getattr(args, "json", False)
 
     if target is None:
-        for line in _describe_rate(mouse, read_mousepoll()):
+        mousepoll_ms = read_mousepoll()
+        if as_json:
+            print_json(
+                document(
+                    "rate",
+                    device=device_json(mouse),
+                    polling=polling_json(mouse, mousepoll_ms),
+                )
+            )
+            return 0
+        for line in _describe_rate(mouse, mousepoll_ms):
             print(line)
         return 0
 
     rate = args.hz
-    ms = HOST_INTERVAL_MS_BY_RATE[rate]
-    did_something = False
+    applied = apply_rate(
+        mouse,
+        rate,
+        target,
+        persist=args.persist,
+        reenumerate=not getattr(args, "no_reset", False),
+    )
+    fresh = _fresh_mouse(mouse.sysfs_dir.name)
+    mousepoll_ms = read_mousepoll()
 
-    if target in ("host", "both"):
-        write_mousepoll(ms)
-        print(f"Host polling interval set to {ms} ms ({rate} Hz) for all USB mice.")
-        print("  Reversible: echo 0 | sudo tee /sys/module/usbhid/parameters/mousepoll")
-        for line in _persistence_advice(ms):
-            print(line)
-        did_something = True
-
-    if target in ("device", "both"):
-        if not args.persist:
-            raise RuntimeError(
-                "Refusing to write the device's EEPROM without confirmation. "
-                f"Re-run with: compxctl rate device {rate} --persist"
+    if as_json:
+        print_json(
+            document(
+                "rate",
+                device=device_json(fresh or mouse),
+                applied=applied_json(applied),
+                # null when the device did not come back: a status bar must not
+                # be handed the numbers the device had before it disappeared.
+                polling=polling_json(fresh, mousepoll_ms),
             )
-        with UsbSession() as session:
-            apply_live_rate(session, rate)
-            changed = session.persist_rate(rate)
-        if changed:
-            print(f"Device EEPROM updated to {rate} Hz ({DEVICE_INTERVAL_CODE_BY_RATE[rate]:#04x}).")
-        else:
-            print(f"Device EEPROM already stored {rate} Hz — nothing written.")
-        print("  Re-plug the mouse (or replug the receiver) for the host to re-read it.")
-        did_something = True
+        )
+        return 0
 
-    if not did_something:  # pragma: no cover - argparse blocks this
-        raise RuntimeError("nothing to do")
+    for line in applied_text(applied, fresh):
+        print(line)
     return 0
+
+
+@dataclass(frozen=True)
+class AppliedRate:
+    """What `rate host|device|both` did — one set of facts, two renderings."""
+
+    target: str
+    rate_hz: int
+    host_interval_ms: int | None
+    eeprom_changed: bool | None
+    reset: str  # "ok" | "failed" | "skipped" | "manual"
+    reset_error: str | None
+
+
+def apply_rate(
+    mouse: Mouse, rate: int, target: str, *, persist: bool, reenumerate: bool = True
+) -> AppliedRate:
+    """Carry out `rate host|device|both`, reporting what actually happened."""
+    if target in ("device", "both") and not persist:
+        # Checked before the first side effect: refusing must not leave
+        # `mousepoll` already written by a command that then failed.
+        raise RuntimeError(
+            "Refusing to write the device's EEPROM without confirmation. "
+            f"Re-run with: compxctl rate device {rate} --persist"
+        )
+
+    host_interval_ms = HOST_INTERVAL_MS_BY_RATE[rate] if target in ("host", "both") else None
+    if host_interval_ms is not None:
+        write_mousepoll(host_interval_ms)
+
+    if target not in ("device", "both"):
+        return AppliedRate(target, rate, host_interval_ms, None, "skipped", None)
+    with HidrawSession(mouse) as session:
+        apply_live_rate(session, rate)
+        changed = session.persist_rate(rate)
+
+    reset, reset_error = _reenumerate(mouse, changed, enabled=reenumerate)
+    return AppliedRate(target, rate, host_interval_ms, changed, reset, reset_error)
+
+
+def _reenumerate(mouse: Mouse, changed: bool, *, enabled: bool) -> tuple[str, str | None]:
+    """Reset the port so the host re-reads the descriptors. (status, error).
+
+    "skipped" means there was nothing to reset for; "manual" means --no-reset
+    asked for the re-plug to stay a human step, and the caller still says so.
+    """
+    if not changed:
+        # Nothing was written: the stored interval and the live packets are
+        # already where this command wanted them, and a device that is working
+        # does not need to disappear off the bus for the sake of it.
+        return "skipped", None
+    if not enabled:
+        return "manual", None
+    try:
+        reset_usb_device(mouse)
+    except RuntimeError as exc:
+        return "failed", str(exc)
+    back = wait_for_mouse(mouse.sysfs_dir.name)
+    if back is None or back.rate_hz is None:
+        # The ioctl succeeded, but success is not the ioctl returning: until the
+        # device is back with a readable endpoint, "ok" would be a claim the
+        # tool cannot support — and a status bar would read it as fact.
+        return "failed", "the device did not come back with a readable endpoint after the reset"
+    return "ok", None
+
+
+def applied_json(applied: AppliedRate) -> dict:
+    return {
+        "target": applied.target,
+        "requested_rate_hz": applied.rate_hz,
+        "host_interval_ms": applied.host_interval_ms,
+        "eeprom_changed": applied.eeprom_changed,
+        "eeprom_code": (
+            f"0x{DEVICE_INTERVAL_CODE_BY_RATE[applied.rate_hz]:02x}"
+            if applied.eeprom_changed is not None
+            else None
+        ),
+        "reset": applied.reset,
+        "reset_error": applied.reset_error,
+    }
+
+
+def applied_text(applied: AppliedRate, fresh: Mouse | None) -> list[str]:
+    """Human rendering of an applied rate, including whether the host noticed."""
+    lines: list[str] = []
+    if applied.host_interval_ms is not None:
+        hz = rate_hz_from_interval_ms(float(applied.host_interval_ms))
+        lines.append(
+            f"Host polling interval set to {applied.host_interval_ms} ms ({hz} Hz) "
+            "for all USB mice."
+        )
+        lines.append("  Reversible: echo 0 | sudo tee /sys/module/usbhid/parameters/mousepoll")
+        lines.extend(_persistence_advice(applied.host_interval_ms))
+    if applied.eeprom_changed is not None:
+        code = DEVICE_INTERVAL_CODE_BY_RATE[applied.rate_hz]
+        lines.append(
+            f"Device EEPROM updated to {applied.rate_hz} Hz ({code:#04x})."
+            if applied.eeprom_changed
+            else f"Device EEPROM already stored {applied.rate_hz} Hz — nothing written, "
+            "no reset needed."
+        )
+    lines.extend(_reenumeration_text(applied, fresh))
+    return lines
+
+
+def _reenumeration_text(applied: AppliedRate, fresh: Mouse | None) -> list[str]:
+    """What the host sees after the reset — or why it needs a hand instead.
+
+    Measured on the verified unit: the endpoint interval does *not* follow the
+    stored interval code. With 0x01 stored the interface advertises `1ms` and
+    with 0x02 stored it still advertises `1ms` — checked on both sides of a port
+    reset the kernel logged as real ("usb 3-2: reset full-speed USB device
+    number 2"). So this reports what the descriptor says instead of asserting
+    that the rate followed, and says which of the two happened.
+    """
+    endpoint = fresh.endpoint if fresh else None
+    detail = f"{endpoint.interval_raw or '?'}, {endpoint.name}" if endpoint else "no endpoint"
+    if applied.reset == "skipped":
+        return []
+    if applied.reset == "manual":
+        return [
+            "  Re-plug the mouse (or the receiver) to make the host re-read the "
+            "descriptors.",
+        ]
+    if applied.reset == "failed":
+        return [
+            f"  Warning: {applied.reset_error}.",
+            "  Re-plug the mouse (or the receiver) to make the host re-read it.",
+        ]
+    if fresh is None or fresh.rate_hz is None:
+        return [
+            "  Warning: the device has not come back with a readable endpoint "
+            "since the reset; re-plug it.",
+        ]
+    reset_line = (
+        f"  Port reset: the receiver re-enumerated, and the host re-read the "
+        f"descriptors; the endpoint advertises {fresh.rate_hz} Hz ({detail})."
+    )
+    if fresh.rate_hz == applied.rate_hz:
+        return [reset_line]
+    return [
+        reset_line,
+        f"  That is expected: on this unit the stored interval does not change the "
+        f"endpoint, which stays at {endpoint.interval_raw if endpoint else '?'} — the "
+        "stored value is what the device itself sends at.",
+    ]
+
+
+@dataclass(frozen=True)
+class DeviceReadouts:
+    """What the config interface answered, and what it failed to answer."""
+
+    stored_rate_hz: int | None
+    active: tuple[int, int] | None
+    slots: list[dict]
+    battery: tuple[int, bool, int] | None
+    warnings: list[str]
+
+
+def collect_readouts(session: HidrawSession) -> DeviceReadouts:
+    """Every device readout in one session; a failed one becomes a warning."""
+    warnings: list[str] = []
+    stored = _attempt(warnings, "stored rate", session.stored_rate_hz)
+    active = _attempt(warnings, "active DPI level", session.active_dpi_level)
+    slots = _attempt(warnings, "DPI slots", session.dpi_slots)
+    battery = _attempt(warnings, "battery", session.battery)
+    return DeviceReadouts(stored, active, slots or [], battery, warnings)
+
+
+def status_text(mouse: Mouse, mousepoll_ms: int | None, readouts: DeviceReadouts) -> list[str]:
+    lines = _describe_rate(mouse, mousepoll_ms)
+    active_slot = active_slot_for_index(readouts.active[0]) if readouts.active else None
+
+    lines.append(
+        "Stored rate: n/a"
+        if readouts.stored_rate_hz is None
+        else f"Stored rate: {readouts.stored_rate_hz} Hz (config memory 0x0000)"
+    )
+
+    if readouts.active is None:
+        lines.append("Active DPI level: n/a")
+    else:
+        text = f"Active DPI level: index 0x{readouts.active[0]:02X} (0x0004)"
+        if active_slot is not None and active_slot < len(readouts.slots):
+            text += f" -> slot [{active_slot}]: {_slot_text(readouts.slots[active_slot])}"
+        lines.append(text)
+
+    if readouts.slots:
+        entries = [f"[{slot['index']}] {_slot_text(slot)}" for slot in readouts.slots]
+        if active_slot is not None and active_slot < len(entries):
+            entries[active_slot] += " <- active"
+        lines.append("DPI slots: " + " ".join(entries))
+    else:
+        lines.append("DPI slots: n/a")
+
+    lines.append(_battery_text(*readouts.battery) if readouts.battery else "Battery: n/a")
+    return lines
+
+
+def status_json(mouse: Mouse, mousepoll_ms: int | None, readouts: DeviceReadouts) -> dict:
+    active_slot = active_slot_for_index(readouts.active[0]) if readouts.active else None
+    return document(
+        "status",
+        device=device_json(mouse),
+        polling=polling_json(mouse, mousepoll_ms),
+        stored_rate_hz=readouts.stored_rate_hz,
+        active_dpi=active_dpi_json(readouts.active, readouts.slots),
+        dpi_slots=[slot_json(slot, active_slot) for slot in readouts.slots],
+        battery=battery_json(*readouts.battery) if readouts.battery else None,
+        warnings=readouts.warnings,
+    )
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     """Read-only snapshot: sysfs rate plus the device's own readouts."""
     mouse = _require_mouse()
     mousepoll_ms = read_mousepoll()
-    for line in _describe_rate(mouse, mousepoll_ms):
+    with HidrawSession(mouse) as session:
+        readouts = collect_readouts(session)
+
+    if getattr(args, "json", False):
+        print_json(status_json(mouse, mousepoll_ms, readouts))
+        return 0
+    for line in status_text(mouse, mousepoll_ms, readouts):
         print(line)
-
-    warnings: list[str] = []
-    with UsbSession() as session:
-        stored = _attempt(warnings, "stored rate", session.stored_rate_hz)
-        active = _attempt(warnings, "active DPI level", session.active_dpi_level)
-        slots = _attempt(warnings, "DPI slots", session.dpi_slots)
-        battery = _attempt(warnings, "battery", session.battery)
-
-    if stored is None:
-        print("Stored rate: n/a")
-    else:
-        print(f"Stored rate: {stored} Hz (config memory 0x0000)")
-
-    active_slot = active_slot_for_index(active[0]) if active else None
-    if active is None:
-        print("Active DPI level: n/a")
-    else:
-        text = f"Active DPI level: index 0x{active[0]:02X} (0x0004)"
-        if active_slot is not None and slots and active_slot < len(slots):
-            text += f" -> slot [{active_slot}]: {_slot_text(slots[active_slot])}"
-        print(text)
-
-    if slots:
-        entries = [f"[{s['index']}] {_slot_text(s)}" for s in slots]
-        if active_slot is not None and active_slot < len(entries):
-            entries[active_slot] += " <- active"
-        print("DPI slots: " + " ".join(entries))
-    else:
-        print("DPI slots: n/a")
-
-    print(_battery_text(*battery) if battery else "Battery: n/a")
-    for warning in warnings:
+    for warning in readouts.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 
-def _attempt(warnings: list[str], label: str, reader: Callable[[], object]) -> object:
+def _attempt(warnings: list[str], label: str, reader: Callable[[], ResultT]) -> ResultT | None:
     try:
         return reader()
     except (RuntimeError, OSError) as exc:
@@ -940,9 +1517,31 @@ def _attempt(warnings: list[str], label: str, reader: Callable[[], object]) -> o
 
 def cmd_dpi(args: argparse.Namespace) -> int:
     value, slot_arg = args.value, args.slot
-    with UsbSession() as session:
-        if value is None or value == "list":
-            return _print_dpi_table(session)
+    as_json = getattr(args, "json", False)
+    mouse = _require_mouse()
+
+    if value is None or value == "list":
+        with HidrawSession(mouse) as session:
+            slots = session.dpi_slots()
+            active = session.active_dpi_level()
+        active_slot = active_slot_for_index(active[0]) if active else None
+        if as_json:
+            # Printed after the session is closed: if closing raised, this would
+            # otherwise be a second document on stdout.
+            print_json(
+                document(
+                    "dpi",
+                    device=device_json(mouse),
+                    active_dpi=active_dpi_json(active, slots),
+                    dpi_slots=[slot_json(slot, active_slot) for slot in slots],
+                )
+            )
+            return 0
+        for line in _dpi_table_text(slots, active, active_slot):
+            print(line)
+        return 0
+
+    with HidrawSession(mouse) as session:
         code = dpi_code(value)
         if code is None:
             raise RuntimeError("DPI must be a multiple of 50 between 50 and 6400")
@@ -964,36 +1563,59 @@ def cmd_dpi(args: argparse.Namespace) -> int:
                     f"slot {slot} holds an undecoded extended encoding; "
                     "refusing to overwrite it"
                 )
-        before = _slot_text(session.dpi_slots()[slot])
+        before = session.dpi_slots()[slot]
         session.write_dpi(slot, code)
-    print(f"DPI set: slot {slot} -> {value} (was {before})")
-    return 0
 
-
-def _print_dpi_table(session: UsbSession) -> int:
-    slots = session.dpi_slots()
-    active = session.active_dpi_level()
-    active_slot = active_slot_for_index(active[0]) if active else None
-    print("  slot  addr    x    y    mul  crc   value")
-    for slot in slots:
-        star = "*" if slot["index"] == active_slot else " "
-        print(
-            f"  {star}{slot['index']}   0x{slot['addr']:04X}  "
-            f"{slot['x']:02X}   {slot['y']:02X}   {slot['mul']:02X}   "
-            f"{slot['crc']:02X}    {_slot_text(slot)}"
+    if as_json:
+        print_json(
+            document(
+                "dpi",
+                device=device_json(mouse),
+                write={
+                    "slot": slot,
+                    "dpi": value,
+                    "previous": slot_json(before, None),
+                    "verified": True,
+                },
+            )
         )
-    if active is None:
-        print("Active DPI level: unknown (0x0004 unset)")
-    elif active_slot is None:
-        print(f"Active DPI level: unknown (0x0004 holds 0x{active[0]:02X})")
-    else:
-        print(f"Active DPI level: slot {active_slot} (index 0x{active[0]:02X})")
+        return 0
+    print(f"DPI set: slot {slot} -> {value} (was {_slot_text(before)})")
     return 0
+
+
+def _dpi_table_text(
+    slots: list[dict], active: tuple[int, int] | None, active_slot: int | None
+) -> list[str]:
+    rows = [
+        f"  {'*' if slot['index'] == active_slot else ' '}{slot['index']}   "
+        f"0x{slot['addr']:04X}  {slot['x']:02X}   {slot['y']:02X}   "
+        f"{slot['mul']:02X}   {slot['crc']:02X}    {_slot_text(slot)}"
+        for slot in slots
+    ]
+    if active is None:
+        trailer = "Active DPI level: unknown (0x0004 unset)"
+    elif active_slot is None:
+        trailer = f"Active DPI level: unknown (0x0004 holds 0x{active[0]:02X})"
+    else:
+        trailer = f"Active DPI level: slot {active_slot} (index 0x{active[0]:02X})"
+    return ["  slot  addr    x    y    mul  crc   value", *rows, trailer]
 
 
 def cmd_battery(args: argparse.Namespace) -> int:
-    with UsbSession() as session:
-        print(_battery_text(*session.battery()))
+    mouse = _require_mouse()
+    with HidrawSession(mouse) as session:
+        percent, charging, state = session.battery()
+    if getattr(args, "json", False):
+        print_json(
+            document(
+                "battery",
+                device=device_json(mouse),
+                battery=battery_json(percent, charging, state),
+            )
+        )
+        return 0
+    print(_battery_text(percent, charging, state))
     return 0
 
 
@@ -1005,7 +1627,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
             f"(0x0000..0x{CONFIG_MEMORY_BYTES - 1:04X})"
         )
     data = bytearray()
-    with UsbSession() as session:
+    with HidrawSession() as session:
         for offset in range(0, length, PROBE_BLOCK_BYTES):
             chunk_length = min(PROBE_BLOCK_BYTES, length - offset)
             chunk = session.read(start + offset, chunk_length)
@@ -1066,8 +1688,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="compxctl",
         description=(
             "Polling rate and DPI for CompX / Ardor Gaming mice (VID 0x25A7). "
-            "The polling rate comes from sysfs and needs no device write; DPI "
-            "uses the vendor protocol and needs pyusb."
+            "The polling rate comes from sysfs and needs no device write; DPI, "
+            "battery and the stored interval use the vendor protocol over "
+            "hidraw. Nothing here needs a third-party package or root, apart "
+            "from `rate host`."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1081,7 +1705,8 @@ def build_parser() -> argparse.ArgumentParser:
             "override and the effective rate. `rate host HZ` writes "
             "usbhid.mousepoll (global, reversible, root). `rate device HZ "
             "--persist` rewrites the device's stored interval through the "
-            "vendor protocol (per-device, persistent, EEPROM wear)."
+            "vendor protocol (per-device, persistent, EEPROM wear) and then "
+            "resets the port so the host re-reads it — no re-plug needed."
         ),
     )
     rate.add_argument(
@@ -1093,18 +1718,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--persist", action="store_true",
         help="confirm the EEPROM write required by `rate device`",
     )
+    rate.add_argument(
+        "--no-reset", action="store_true",
+        help="after --persist, leave the port alone and re-plug by hand instead",
+    )
+    _add_json_flag(rate)
     rate.set_defaults(func=cmd_rate)
 
     status = subparsers.add_parser("status", help="read-only device snapshot")
+    _add_json_flag(status)
     status.set_defaults(func=cmd_status)
 
     dpi = subparsers.add_parser("dpi", help="list DPI slots or write one")
     dpi.add_argument("value", nargs="?", type=_parse_dpi_value, default=None,
                      help="'list' or a DPI multiple of 50 in 50..6400")
     dpi.add_argument("--slot", type=int, default=None, help="write slot S (0..5)")
+    _add_json_flag(dpi)
     dpi.set_defaults(func=cmd_dpi)
 
     battery = subparsers.add_parser("battery", help="read battery level and state")
+    _add_json_flag(battery)
     battery.set_defaults(func=cmd_battery)
 
     probe = subparsers.add_parser("probe", help="read config memory (read-only)")
@@ -1113,6 +1746,29 @@ def build_parser() -> argparse.ArgumentParser:
     probe.set_defaults(func=cmd_probe)
 
     return parser
+
+
+def _add_json_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--json", action="store_true",
+        help=(
+            f"print one JSON document on stdout (schema {JSON_SCHEMA}), errors "
+            "included; unknown values are null"
+        ),
+    )
+
+
+def _command_name(args: argparse.Namespace) -> str:
+    return getattr(args, "command", None) or "rate"
+
+
+def _fail(args: argparse.Namespace, message: str, code: int) -> int:
+    """One error, rendered the way the rest of this run is rendered."""
+    if getattr(args, "json", False):
+        print_json(document(_command_name(args), error={"message": message}))
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1124,8 +1780,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return func(args)
     except (RuntimeError, OSError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        return _fail(args, str(exc), 1)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
