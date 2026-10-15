@@ -113,10 +113,32 @@ mismatch on a write that worked — never a silent wrong value — and
 - `--json` now prints its document when a run is interrupted as well (exit code
   `130`). A status bar that kills a slow call for its own timeout used to get an
   empty stdout, which is the one thing the JSON contract promises not to do.
+- `SIGTERM` is now handled like Ctrl+C. Status bars do not send SIGINT: Waybar,
+  Polybar and i3status kill a slow child with `SIGTERM`, and Python's default for
+  that signal is to die inside the C handler — so a run with `--json` ended 143
+  with an empty stdout, which is the one thing that contract promises never to
+  do. It now prints the same error document and exits `143` (128 + 15); Ctrl+C
+  keeps `130`.
+- The hidraw node is opened `O_NONBLOCK` and a read that finds nothing
+  (`BlockingIOError`) goes back to waiting for the time it has left. A blocking
+  hidraw read has no timeout of its own, so a report taken between the readiness
+  check and the read could have parked the call indefinitely.
+- A descriptor that is opened for the lock is closed even when the wait for that
+  lock is interrupted. The CLI would exit and let the kernel do it; a
+  long-lived process using `HidrawSession` would have leaked it.
+- The firmware's own acknowledgements (`09 07 …` echo of a write, `09 11 …` for a
+  live packet) no longer count as "another program is talking to the mouse". If a
+  read answer is lost while an acknowledgement arrives, the diagnosis used to
+  blame a second program and — worse — the session did not mark the device
+  silent, so `status` paid the full retry budget for every remaining readout.
+  Acknowledgements are recognised by the opcode they echo, and only a frame that
+  looks like an answer to a *different* question is treated as foreign traffic.
+- `probe --length 0` (and a negative length) used to print nothing and exit `0`,
+  which reads like "the memory is empty". It is now an error with a message.
 - Tests for hidraw node lookup, the write acknowledge, the leftover-reply
   readback, the port reset, the report-descriptor walk (run against both
-  descriptors captured from the hardware), the lock and the JSON documents: 210
-  in total.
+  descriptors captured from the hardware), the lock, the signal handling and the
+  JSON documents: 219 in total.
 
 ### Removed
 - The `pyusb` dependency, the `[device]` extra and every import of it.

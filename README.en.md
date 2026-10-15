@@ -73,7 +73,17 @@ measurement, not a guess.
 The interface also carries traffic of its own: an acknowledge for every live
 interval packet (`09 11 …`) and for every config write (`09 07 …`, echoing the
 bytes that were written). All of it is filtered out by opcode, address and
-checksum instead of being mistaken for an answer.
+checksum instead of being mistaken for an answer — and it is not taken for a sign
+that somebody else is on the node: an acknowledge is the device talking about
+itself, not an answer to a question. The difference shows in the diagnosis: only
+acknowledgements coming back means "the mouse is asleep" and stops the
+questions, while an answer to a *different* question means "something else is
+talking to this node".
+
+The node is opened non-blocking (`O_NONBLOCK`): a blocking hidraw read has no
+timeout of its own, so it could sleep indefinitely if the report were taken
+between the readiness check and the read. Every deadline here is the tool's own,
+never the kernel's.
 
 **The node is chosen by its report descriptor, not by interface number.** The
 descriptor is read from sysfs (world-readable) and parsed: the right node is the
@@ -240,8 +250,12 @@ What you can rely on:
 
 * a runtime error is **one** JSON document on stdout:
   `{"schema": 1, "command": "status", "error": {"message": "..."}}`, with exit
-  code `1`; an interrupt (`Ctrl+C`, or SIGINT from a bar's timeout, exit code
-  `130`) produces the same document with `error` instead of an empty stdout;
+  code `1`;
+* an interrupt produces the same document with `error` instead of an empty
+  stdout: `Ctrl+C` exits `130`, `SIGTERM` exits `143`. The second one matters
+  more than it sounds: Waybar, Polybar and i3status kill a slow child with
+  `SIGTERM`, and Python has no default handler for it, so without catching it the
+  bar would read nothing at all;
 * a command-line error (exit code `2`) stays text on stderr and produces no
   document: that is a typo in your script, not a state of the device;
 * an unknown value is `null`, never the string `"n/a"`;
@@ -306,7 +320,8 @@ verified.
 | `0` | success |
 | `1` | runtime error — no device, no permission, bad reply, refused readback |
 | `2` | command-line error (argparse) |
-| `130` | interrupted |
+| `130` | interrupted by Ctrl+C (`SIGINT`) |
+| `143` | interrupted by `SIGTERM` (what a status bar sends on its timeout): 128 + 15 |
 
 With `--json` a runtime error arrives as a document on stdout; the exit code is
 unchanged.
@@ -317,7 +332,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-210 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+219 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:

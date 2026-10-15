@@ -40,17 +40,19 @@ they were verified on hardware; the framing is unchanged.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import json
 import os
 import re
 import select
+import signal
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence, TypeVar
+from typing import Callable, NamedTuple, Sequence, TypeVar
 
 __version__ = "3.0.0"
 
@@ -80,6 +82,10 @@ MOUSE_INTERFACE_CLASS = (0x03, 0x01, 0x02)
 # protocol 0x01. It carries the vendor report ids 6/8/9, so its hidraw node is
 # the one the reverse-engineered protocol talks to.
 CONFIG_INTERFACE_CLASS = (0x03, 0x01, 0x01)
+
+# Opcodes the firmware uses to acknowledge rather than to answer: 0x07 echoes a
+# config-memory write, 0x11 acknowledges a live interval packet.
+DEVICE_ACK_OPCODES = (0x07, 0x11)
 
 # Reply frames are input report 9 (see the module docstring), and the largest
 # report on that interface is 17 bytes. Reading more than one report's worth is
@@ -762,12 +768,32 @@ def dpi_slot_addr(slot: int) -> int:
 # ==========================================================================
 
 
+class AwaitResult(NamedTuple):
+    """What waiting for a reply found.
+
+    `foreign` separates a device that is not answering from a node somebody else
+    is also talking on: the first is worth giving up on quickly, the second is
+    worth naming in the error.
+    """
+
+    frame: bytes | None
+    reason: str | None
+    foreign: bool
+
+
 class HidrawIO:
     """The syscalls the protocol needs, isolated so tests can replace them."""
 
     @staticmethod
     def open(path: Path) -> int:
-        return os.open(path, os.O_RDWR)
+        """Open the node non-blocking.
+
+        A blocking hidraw read sleeps until a report arrives, so a report
+        consumed between the readiness check and the read itself would park the
+        call with no timeout of its own. Non-blocking, that read raises
+        `BlockingIOError` instead, and the wait keeps its own deadline.
+        """
+        return os.open(path, os.O_RDWR | os.O_NONBLOCK)
 
     @staticmethod
     def set_feature(fd: int, frame: bytes) -> None:
@@ -777,9 +803,25 @@ class HidrawIO:
 
     @staticmethod
     def read_report(fd: int, timeout_ms: int) -> bytes | None:
-        """The next input report, or None when the timeout runs out."""
-        ready, _, _ = select.select([fd], [], [], timeout_ms / 1000.0)
-        return bytes(os.read(fd, HIDRAW_READ_BYTES)) if ready else None
+        """The next input report, or None when the timeout runs out.
+
+        The descriptor is non-blocking, so the deadline here is the only thing
+        that decides how long this waits: a read that finds nothing — because
+        whoever made the descriptor readable got there first — goes back to
+        waiting for whatever time is left instead of sleeping indefinitely.
+        """
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                return None
+            try:
+                return bytes(os.read(fd, HIDRAW_READ_BYTES))
+            except BlockingIOError:
+                continue
 
     @staticmethod
     def lock(fd: int, timeout_ms: int) -> bool:
@@ -814,6 +856,18 @@ class HidrawIO:
     @staticmethod
     def close(fd: int) -> None:
         os.close(fd)
+
+
+def is_device_ack(report: bytes) -> bool:
+    """Whether a frame is the firmware acknowledging the write just sent.
+
+    The interface answers a config write with an echo of it (`09 07 …`) and a
+    live interval packet with a `09 11 …`. Both carry the same input-report id
+    as an answer, so the only thing that tells them apart is the opcode they
+    echo. They are the device talking about itself: not an answer to a question,
+    and not evidence of another program on the node either.
+    """
+    return len(report) == COMPX_FRAME_BYTES and report[1] in DEVICE_ACK_OPCODES
 
 
 def is_config_reply(report: bytes) -> bool:
@@ -869,16 +923,19 @@ class HidrawSession:
         # no sequence number, a same-header frame from that session is
         # indistinguishable from its own answer.
         lock_fd = self._open(path, "lock")
-        if not self._io.lock(lock_fd, LOCK_WAIT_MS):
-            self._io.close(lock_fd)
-            raise RuntimeError(
-                f"Another compxctl is talking to the mouse: the lock on {path} is "
-                f"held and did not come free within {LOCK_WAIT_MS} ms. Try again in "
-                "a moment."
-            )
         try:
+            if not self._io.lock(lock_fd, LOCK_WAIT_MS):
+                raise RuntimeError(
+                    f"Another compxctl is talking to the mouse: the lock on {path} "
+                    f"is held and did not come free within {LOCK_WAIT_MS} ms. Try "
+                    "again in a moment."
+                )
             self._fd = self._open(path, "read")
-        except RuntimeError:
+        except BaseException:
+            # BaseException, not Exception: Ctrl+C or SIGTERM arriving during the
+            # wait for the lock must not leave a descriptor behind. The CLI exits
+            # and the kernel closes it anyway, but this class is usable from a
+            # long-lived process too, where nothing else would.
             self._io.close(lock_fd)
             raise
         self._lock_fd = lock_fd
@@ -924,10 +981,12 @@ class HidrawSession:
         register passes the same header and checksum checks as a fresh one, so
         nothing stale may be left in front of the answer being asked for.
 
-        The loop ends on the first read that brings nothing back — a short read
-        included, which is falsy — and in any case after HIDRAW_DRAIN_MAX_FRAMES,
-        so neither a closed pipe nor a device that streams faster than this
-        drains can hold a command here.
+        The loop ends on the first read that brings nothing back, which with a
+        non-blocking descriptor is the ordinary "queue is empty", and in any
+        case after HIDRAW_DRAIN_MAX_FRAMES, so a device that streams faster than
+        this drains cannot hold a command here either. A zero-length read is not
+        something the kernel returns for a connected hidraw node; the falsy
+        check is there so that "no data" can never be mistaken for data.
         """
         fd = self._open_fd()
         drained = 0
@@ -949,10 +1008,12 @@ class HidrawSession:
             raise RuntimeError("The hidraw session is not open; use it as a context manager.")
         return self._fd
 
-    def _await_reply(self, reject: Callable[[bytes], str | None]) -> tuple[bytes | None, str | None]:
+    def _await_reply(self, reject: Callable[[bytes], str | None]) -> AwaitResult:
         """Drain input reports until one passes `reject` or the deadline passes.
 
-        Returns (frame, why the last frame was refused). Draining instead of
+        Returns what it found: the frame, why the last frame was refused, and
+        whether anything refused looked like somebody else's answer rather than
+        the device's own acknowledgement. Draining instead of
         giving up on the first foreign frame is what keeps the queue clean: the
         firmware sends frames of its own — one acknowledge per live interval
         packet and per config write — and a command sent again while those are
@@ -963,19 +1024,21 @@ class HidrawSession:
         fd = self._open_fd()
         deadline = self._clock() + self.timeout_ms / 1000.0
         detail: str | None = None
+        foreign = False
         while True:
             remaining_ms = round((deadline - self._clock()) * 1000)
             if remaining_ms <= 0:
-                return None, detail
+                return AwaitResult(None, detail, foreign)
             report = self._io.read_report(fd, remaining_ms)
             if report is None:
-                return None, detail
+                return AwaitResult(None, detail, foreign)
             if not is_config_reply(report):
                 continue
             reason = reject(report)
             if reason is None:
-                return report, None
+                return AwaitResult(report, None, foreign)
             detail = reason
+            foreign = foreign or not is_device_ack(report)
 
     # -- request/response --------------------------------------------------
 
@@ -1006,21 +1069,34 @@ class HidrawSession:
             )
 
         detail = timeout_message
-        heard_something = False
+        foreign = False
         for _ in range(READ_ATTEMPTS):
             self._drain_pending()
             self.send(packet)
-            reply, reason = self._await_reply(reject)
-            if reply is not None:
-                return parse(reply)
-            detail = reason or timeout_message
-            heard_something = heard_something or reason is not None
-        if not heard_something:
-            self._silent_reason = f"no input report within {self.timeout_ms} ms, "                 f"{READ_ATTEMPTS} attempts in a row"
+            result = self._await_reply(reject)
+            if result.frame is not None:
+                return parse(result.frame)
+            detail = result.reason or timeout_message
+            foreign = foreign or result.foreign
+        if not foreign:
+            # Nothing came back, or only the device's own acknowledgements did.
+            # Either way this session will not get an answer, and the remaining
+            # readouts of `status` should not each pay the retry budget to learn
+            # that again: fourteen seconds of a status bar on a mouse that is
+            # switched off. A frame that looks like an answer to a *different*
+            # question is another matter — that is somebody else on the node.
+            silence = (
+                "nothing came back at all"
+                if detail == timeout_message
+                else "only the device's own acknowledgements came back, no answer"
+            )
+            self._silent_reason = (
+                f"no answer within {self.timeout_ms} ms per attempt, "
+                f"{READ_ATTEMPTS} attempts in a row"
+            )
             raise RuntimeError(
-                f"{timeout_message} — nothing came back at all. Is the mouse "
-                "switched off or asleep? (The rest of this command's readouts are "
-                "skipped.)"
+                f"{timeout_message} — {silence}. Is the mouse switched off or "
+                "asleep? (The rest of this command's readouts are skipped.)"
             )
         raise RuntimeError(
             f"{detail} (tried {READ_ATTEMPTS} times; is another program "
@@ -1833,6 +1909,10 @@ def cmd_battery(args: argparse.Namespace) -> int:
 
 def cmd_probe(args: argparse.Namespace) -> int:
     start, length = args.start, args.length
+    if length <= 0:
+        # Zero used to be a silent success: the loop simply did not run and the
+        # command printed nothing, which reads like "the memory is empty".
+        raise RuntimeError(f"length must be at least 1 byte, got {length}")
     if start < 0 or start + length > CONFIG_MEMORY_BYTES:
         raise RuntimeError(
             f"window 0x{start:04X}+{length} leaves the config memory "
@@ -1970,6 +2050,35 @@ def _add_json_flag(parser: argparse.ArgumentParser) -> None:
     )
 
 
+class Interrupted(Exception):
+    """A signal asked this run to stop; the caller turns it into an exit code."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"interrupted by signal {signum}")
+        self.signum = signum
+
+    @property
+    def exit_code(self) -> int:
+        """The shell convention: 128 + the signal number."""
+        return 128 + self.signum
+
+
+def _raise_interrupted(signum: int, _frame: object) -> None:
+    raise Interrupted(signum)
+
+
+def _install_signal_handlers() -> None:
+    """Let SIGTERM end a run the way Ctrl+C does.
+
+    Status bars do not interrupt a slow child with SIGINT: Waybar, Polybar and
+    i3status send SIGTERM when their own timeout expires. Python's default for
+    SIGTERM is to die inside the C handler, so the process would exit 143 with an
+    empty stdout — the one thing the `--json` contract promises never to do.
+    """
+    with contextlib.suppress(ValueError):  # not the main thread: nothing to do
+        signal.signal(signal.SIGTERM, _raise_interrupted)
+
+
 def _command_name(args: argparse.Namespace) -> str:
     return getattr(args, "command", None) or "rate"
 
@@ -1983,7 +2092,16 @@ def _fail(args: argparse.Namespace, message: str, code: int) -> int:
     return code
 
 
+def _interrupted(args: argparse.Namespace, code: int) -> int:
+    """One document for `--json`, one line for everyone else."""
+    if getattr(args, "json", False):
+        return _fail(args, "interrupted", code)
+    print("\nInterrupted.", file=sys.stderr)
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
+    _install_signal_handlers()
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "target", None) is not None and getattr(args, "hz", None) is None:
@@ -1993,13 +2111,11 @@ def main(argv: list[str] | None = None) -> int:
         return func(args)
     except (RuntimeError, OSError, ValueError) as exc:
         return _fail(args, str(exc), 1)
+    except Interrupted as exc:
+        # SIGTERM: 143, the usual shell convention for 128 + 15.
+        return _interrupted(args, exc.exit_code)
     except KeyboardInterrupt:
-        if getattr(args, "json", False):
-            # A status bar that interrupts a slow run still gets one parseable
-            # document, like every other way this command can end.
-            return _fail(args, "interrupted", 130)
-        print("\nInterrupted.", file=sys.stderr)
-        return 130
+        return _interrupted(args, 130)
 
 
 if __name__ == "__main__":

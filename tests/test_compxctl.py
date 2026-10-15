@@ -18,6 +18,7 @@ outside the standard library, enforced by reading its own AST.
 from __future__ import annotations
 
 import ast
+import signal
 import json
 import os
 import shutil
@@ -193,6 +194,16 @@ def test_hidraw_ioctl_numbers_match_the_kernel_headers() -> None:
     assert compxctl.hidraw_set_feature_ioctl(17) == 0xC0114806
     assert compxctl.hidraw_set_feature_ioctl(8) == 0xC0084806
     assert compxctl.usbdevfs_reset_ioctl == 0x00005514
+
+
+def test_is_device_ack_tells_the_firmware_talking_about_itself() -> None:
+    """A write echo and a live-packet acknowledge are not answers, and not
+    evidence of another program either."""
+    assert compxctl.is_device_ack(_write_ack(0x0000, bytes((0x01, 0x54))))
+    assert compxctl.is_device_ack(_live_ack(0x01))
+    assert not compxctl.is_device_ack(_read_reply(0x0000, b"\x01\x54"))
+    assert not compxctl.is_device_ack(_reply(b"\x09\x04\x00\x00\x00", b"\x02\x64\x00"))
+    assert not compxctl.is_device_ack(b"")
 
 
 def test_is_config_reply_accepts_only_input_report_nine() -> None:
@@ -805,6 +816,24 @@ def test_the_reading_descriptor_is_opened_only_after_the_lock(tmp_path: Path) ->
     ]
 
 
+def test_a_lock_interrupted_by_a_signal_releases_its_descriptor(tmp_path: Path) -> None:
+    """Ctrl+C during the wait for the lock must not leak the descriptor.
+
+    The CLI would exit and let the kernel close it, but HidrawSession is also
+    usable from a long-lived process, where nothing else would.
+    """
+
+    class InterruptedLockIO(FakeHidrawIO):
+        def lock(self, fd: int, timeout_ms: int) -> bool:
+            raise KeyboardInterrupt
+
+    io = InterruptedLockIO()
+    with pytest.raises(KeyboardInterrupt):
+        with make_session(io, tmp_path):
+            pass
+    assert io.closed == [3]
+
+
 def test_a_locked_node_is_not_left_open(tmp_path: Path) -> None:
     io = FakeHidrawIO(lock_available=False)
     with pytest.raises(RuntimeError, match="Another compxctl"):
@@ -831,6 +860,19 @@ def test_session_refuses_a_node_that_is_not_the_vendor_interface(tmp_path: Path)
     with pytest.raises(RuntimeError, match="not the vendor config interface"):
         with compxctl.HidrawSession(mouse, io=FakeHidrawIO()):
             pass
+
+
+def test_acknowledgements_alone_are_not_another_program(tmp_path: Path) -> None:
+    """Only the device's own acks came back: that is a sleeping mouse, not a
+    node somebody else is talking on — and it must still stop the session."""
+    io = FakeHidrawIO([_write_ack(0x0000, bytes((0x01, 0x54)))] * compxctl.READ_ATTEMPTS)
+    with make_session(io, tmp_path) as session:
+        with pytest.raises(RuntimeError, match="own acknowledgements"):
+            session.read(0x0000, 2)
+        sent = len(io.sent)
+        with pytest.raises(RuntimeError, match="stopped answering"):
+            session.read(0x0004, 2)
+        assert len(io.sent) == sent  # the fast-fail path still applies
 
 
 def test_session_stops_asking_once_the_device_has_gone_quiet(tmp_path: Path) -> None:
@@ -902,6 +944,56 @@ def test_session_read_ignores_the_acknowledge_of_its_own_write(tmp_path: Path) -
         assert session.read(0x0000, 2) == b"\x01\x54"
 
 
+def test_hidraw_open_is_non_blocking(monkeypatch) -> None:
+    """A blocking read has no timeout of its own: the deadline must be ours."""
+    captured: list[int] = []
+
+    def fake_open(path, flags, *args, **kwargs):
+        captured.append(flags)
+        return 3
+
+    monkeypatch.setattr(compxctl.os, "open", fake_open)
+    compxctl.HidrawIO.open(Path("/dev/hidraw1"))
+    assert captured and captured[0] & os.O_NONBLOCK
+
+
+def test_read_report_survives_an_empty_read(monkeypatch) -> None:
+    """Readiness and content are not the same promise: a read that finds nothing
+    goes back to waiting for the time it has left instead of blocking forever."""
+    calls = {"reads": 0}
+    clock = FakeClock()
+
+    def fake_select(rlist, wlist, xlist, timeout):
+        clock.advance(min(timeout, 0.01))  # waiting costs a little, not the budget
+        return ([3], [], [])
+
+    def fake_read(fd, count):
+        calls["reads"] += 1
+        if calls["reads"] == 1:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return b"\x09" + b"\x00" * 16
+
+    monkeypatch.setattr(compxctl.select, "select", fake_select)
+    monkeypatch.setattr(compxctl.os, "read", fake_read)
+    monkeypatch.setattr(compxctl.time, "monotonic", clock)
+    report = compxctl.HidrawIO.read_report(3, timeout_ms=500)
+    assert report is not None and report[0] == 0x09
+    assert calls["reads"] == 2  # the empty read went back to waiting, then a frame came
+
+
+def test_read_report_gives_up_at_the_deadline(monkeypatch) -> None:
+    clock = FakeClock()
+
+    def fake_select(rlist, wlist, xlist, timeout):
+        clock.advance(timeout)
+        return ([], [], [])
+
+    monkeypatch.setattr(compxctl.select, "select", fake_select)
+    monkeypatch.setattr(compxctl.time, "monotonic", clock)
+    assert compxctl.HidrawIO.read_report(3, timeout_ms=200) is None
+    assert clock.now == 0.2
+
+
 def test_session_read_retries_when_no_answer_comes(tmp_path: Path) -> None:
     """A lost answer over the radio link is worth another try — a lost answer,
     not a foreign frame."""
@@ -922,7 +1014,9 @@ def test_await_reply_gives_up_when_the_deadline_passes(tmp_path: Path) -> None:
     io = DeadlineIO(clock)
     session = compxctl.HidrawSession(find_mouse(tmp_path), timeout_ms=500, io=io, clock=clock)
     with session:
-        assert session._await_reply(lambda report: "never") == (None, None)
+        assert session._await_reply(lambda report: "never") == compxctl.AwaitResult(
+            None, None, False
+        )
     assert io.timeouts == [500]
     assert clock.now == 0.5
 
@@ -1986,6 +2080,33 @@ def test_keyboard_interrupt_still_prints_a_document_with_json(monkeypatch, capsy
     assert doc["command"] == "status"
     assert "interrupted" in doc["error"]["message"]
     assert captured.err == ""
+
+
+def test_sigterm_ends_like_ctrl_c_with_the_shell_code(monkeypatch, capsys) -> None:
+    """Status bars send SIGTERM, not SIGINT: it must still produce a document."""
+
+    def interrupted(*args, **kwargs):
+        raise compxctl.Interrupted(signal.SIGTERM)
+
+    monkeypatch.setattr(compxctl, "find_mouses", interrupted)
+    assert compxctl.main(["status", "--json"]) == 143
+    doc = json.loads(capsys.readouterr().out)
+    assert "interrupted" in doc["error"]["message"]
+
+
+def test_the_sigterm_handler_raises_the_shared_interrupt() -> None:
+    with pytest.raises(compxctl.Interrupted) as excinfo:
+        compxctl._raise_interrupted(signal.SIGTERM, None)
+    assert excinfo.value.exit_code == 143
+    assert compxctl.Interrupted(signal.SIGINT).exit_code == 130
+
+
+def test_probe_refuses_a_window_that_is_not_a_window(monkeypatch, capsys, tmp_path: Path) -> None:
+    """`--length 0` used to print nothing and exit 0, which reads like success."""
+    assert compxctl.main(["probe", "--start", "0x10", "--length", "0"]) == 1
+    assert "at least 1 byte" in capsys.readouterr().err
+    assert compxctl.main(["probe", "--start", "0x10", "--length", "-8"]) == 1
+    assert "at least 1 byte" in capsys.readouterr().err
 
 
 def test_plain_error_goes_to_stderr(monkeypatch, capsys) -> None:
