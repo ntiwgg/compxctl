@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] — 2026-10-17
+
+### Removed
+- The interactive screen (`compxctl tui`) and everything in `contrib/` are gone,
+  at the owner's request: the cursors screen, the GNOME/Argos/Waybar/Polybar
+  widgets, the shared `compx-status.sh` adapter and the GNOME tray indicator. The
+  tool is a command line again, with one JSON document for anything that wants to
+  display it.
+- Tests for the removed code went with it: 230 remain. The three tests for the
+  active-DPI-level refusal stayed, because they cover behaviour that has nothing
+  to do with a screen.
+
+### Note
+- Git history still contains the removed code (commits `8746d90`, `dde3add`), so
+  it can be brought back with `git revert` or `git show`; nothing was rewritten.
+  The panel trouble that prompted this was not caused by the indicator: gnome-shell
+  crashed inside `libmutter-51.so.0` in `wl_client_destroy`, and four of the
+  installed extensions report OUT OF DATE on GNOME 51.
+
 ## [4.3.0] — 2026-10-16
 
 ### Fixed

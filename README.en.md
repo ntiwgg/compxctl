@@ -275,92 +275,6 @@ $ compxctl battery                      # percent, charging, link mode
 $ compxctl probe --start 0x0000 --length 0x20   # read-only config memory dump
 ```
 
-### Interactive screen: `tui`
-
-```console
-$ compxctl tui
-```
-
-A full-screen `curses` mode (standard library too): the readings of `status`, and
-DPI slots edited with the arrow keys.
-
-```
- compxctl — CompX / Ardor Gaming
-  Device     : 2.4G Dual Mode Mouse
-  Battery    : 100% (2.4G)
-  Rate       : 1000 Hz (device descriptor), stored 1000 Hz
-  DPI slots — 0..5 editable, 6..7 undecoded and read-only:
-  -> Slot 0: 400      [ACTIVE]
-     Slot 1: 1000
-     …
-     Slot 6: raw:0xEF [read-only]
-  q quit · ↑/↓ slot · ←/→ ±50 DPI · [ ] ±400 · Enter write · r refresh
-```
-
-What matters:
-
-* **No second protocol.** The screen calls the same functions as the commands:
-  `collect_readouts` to read and `apply_dpi_slot` to write, so a write is verified
-  by readback and four identical bytes are not written at all.
-* **Slots 6 and 7 are read-only.** The down arrow stops at slot 5, and 6 and 7
-  carry a marker: an undecoded encoding cannot be overwritten, by accident or
-  otherwise.
-* **A change is proposed first, written second.** An arrow key edits the proposal
-  (marked `* not written`), Enter writes it, and only for the selected slot.
-* **The terminal is restored** on `q`, `Esc`, `Ctrl+C` and `SIGTERM` (the last one
-  exits `143`, as everywhere). Started without a terminal, it explains itself and
-  exits `1`.
-* `--tries` and `--timeout-ms` apply here too: the screen reads the device with
-  the patience the command line asked for.
-
-### Ready-made integrations: `contrib/`
-
-The repository ships panel widgets — all through one adapter,
-`contrib/compx-status.sh` (bash + `python3`, no `jq`), so that three widgets
-cannot drift apart in formatting:
-
-| File | Where | What it gives |
-|---|---|---|
-| `contrib/compx-status.sh` | into `PATH` (`~/.local/bin`) | the tool's JSON → one line, Waybar JSON, or the Argos format |
-| `contrib/gnome-argos/compx.30s.sh` | `~/.config/argos/` | a GNOME widget (Argos, Guillotine, Executor): battery, DPI, a menu of presets and a way into `tui` |
-| `contrib/waybar/config.jsonc` | into the Waybar config | a `custom/compx` module with a tooltip, `charging`/`discharging`/`asleep` classes and `tui` on middle click |
-| `contrib/polybar/module.ini` | into the Polybar config | `[module/compx]` with the same text and clicks |
-| `contrib/gnome-tray/compx-tray.py` | `~/.local/bin/compx-tray` | a GNOME tray indicator: the battery percentage drawn into the icon, a menu of DPI presets and a way into `tui` |
-
-A sleeping mouse is a state, not an error: the widget keeps its place and says
-`🖱️ —` instead of emptying itself or waiting out `4 × 500 ms`. A full-screen `tui`
-from a panel needs a terminal (`foot -e compxctl tui`) — the panel itself has
-none.
-
-#### The mouse in the GNOME tray
-
-```console
-$ ln -s "$PWD/compxctl.py" ~/.local/bin/compxctl     # the tool in PATH, one copy
-$ install -m 755 contrib/gnome-tray/compx-tray.py ~/.local/bin/compx-tray
-$ cp contrib/gnome-tray/compx-tray.desktop ~/.config/autostart/
-$ compx-tray &                                        # or just log out and in
-```
-
-Why this way rather than "install Argos":
-
-* **Script-running extensions lag behind the shell.** Executor (the maintained
-  Argos fork) supports up to GNOME 50 as of 51, so on 51 it will not install at
-  all. A GNOME desktop already ships `appindicatorsupport`, the extension that
-  draws any StatusNotifierItem in the panel, and that protocol is stable.
-* **Indicator labels do not work in GNOME.** The extension has a
-  [regression with `set_label`](https://bugs.launchpad.net/ubuntu/+source/gnome-shell-extension-appindicator/+bug/2059818):
-  the label stopped being drawn. So the percentage is *painted into the icon*,
-  with its own background so it reads on a light or a dark panel; the tooltip is
-  built from `Title`, and everything else lives in the menu.
-* **It needs only `python-gobject`** with `Gtk 3` and `AyatanaAppIndicator3`,
-  which any GNOME already has. The tool itself gains no dependency.
-
-The menu holds the battery, the active DPI and the rate (read-only), four DPI
-presets with the current one ticked, "Открыть экран (tui)" in a terminal, a
-refresh and a quit. One indicator per session (a `flock`), polling the device
-every 10 seconds with the same `--tries 1 --timeout-ms 150` as the other widgets:
-a sleeping mouse is a `—` badge, not an exception.
-
 ### Machine-readable output: `--json`
 
 `rate`, `status`, `dpi` and `battery` accept `--json` — exactly one JSON
@@ -468,7 +382,7 @@ unchanged.
 $ pip install pytest && pytest
 ```
 
-250 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
+230 tests that need no hardware, no root, no `/dev/hidraw` and no third-party
 packages: the device layer runs against a fake hidraw IO object, and the sysfs
 layer against a synthetic tree, hidraw node lookup included. They also pin down
 real bugs found on live hardware:
@@ -510,7 +424,7 @@ All of the following was measured on an Ardor Gaming Ulta (`25a7:fa7b`), kernel
   level the mouse is on reads back as correct and disappears within five to ten
   seconds (three observations out of three): the mouse mirrors its RAM value back
   over it. Writes to inactive levels hold, and are still in the dump minutes later.
-  This is why `dpi` refuses and why `tui` will not edit the active level.
+  This is why `dpi` refuses to write the active level.
 * **The live packets do not change the report stream.** Measured with a counter on
   the input reports (one report is one poll, unlike the removed `check`, which
   counted evdev events): with `live = 500` and `live = 1000` reports arrive at the
