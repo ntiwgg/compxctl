@@ -1,0 +1,89 @@
+.TH COMPXCTL 1 "2026-10-18" "5.0.0-dev" "User Commands"
+.SH NAME
+compxctl \- inspect and configure CompX USB mice on Linux
+.SH SYNOPSIS
+.B compxctl
+[options] command [arguments]
+.SH DESCRIPTION
+Standalone C17 Linux utility. No Python or ncurses runtime is needed.
+With no command, opens the TUI on an interactive terminal, otherwise reads status.
+Device writes require an explicit confirmation. Configuration readback does not
+prove power-cycle persistence or an effect on report frequency.
+.SH COMMANDS
+.TP
+.B tui
+Interactive overview, DPI editor, interval settings, config dump, receiver picker
+and capability reference. Requires an ANSI-compatible terminal of at least 80x24.
+.TP
+.B devices
+List supported USB receivers and their USB topology identifiers.
+.TP
+.B status
+Read device state. Individual read failures are reported as warnings and nulls.
+.TP
+.B battery
+Read battery level and charging state.
+.TP
+.B dpi list
+Read all eight DPI slots. An asterisk marks the active level.
+.TP
+.B dpi set SLOT DPI --confirm
+Write an inactive slot 0..5. DPI is 50..6400 in steps of 50.
+An unknown active level blocks writes. Do not press the DPI button during writes.
+.TP
+.B rate
+Show descriptor interval and configured host parameter. Frequency is unmeasured.
+.TP
+.B rate host HZ --confirm
+Set global usbhid.mousepoll. Accepts 0, 125, 500, 1000; 0 removes the override.
+Requires root. Reconnect affected mice to apply. Rate mapping is for full-speed
+USB; the parameter has different encoding on high-speed endpoints.
+.TP
+.B rate device HZ --persist --confirm
+Experimental write of a stored interval code, for 125/500/1000.
+Its effect on polling and persistence after power-off are unverified.
+.TP
+.B probe --start ADDR --length BYTES
+Read a window of config memory. Addresses may be hexadecimal; range 0..0xffff.
+.TP
+.B reset --confirm
+Reset the whole USB receiver, affecting all functions including a paired keyboard.
+Requires separate USB device access. This does not promise driver restart or
+application of the host polling parameter.
+.TP
+.B capabilities
+List supported operations and functions whose protocol is unknown.
+.SH OPTIONS
+.TP
+.B --device USB-ID
+Select a receiver explicitly, for example 3-2. Required if multiple receivers exist.
+.TP
+.B --demo
+Use a simulated volatile device. No hardware or system settings are written.
+.TP
+.B --json
+Emit schema-3 JSON. Incompatible with tui. Errors include mutation-attempt status.
+.TP
+.B --timeout-ms N
+Reply deadline per attempt, 1..5000 milliseconds, default 250.
+This does not bound the kernel's feature-report ioctl or USB reset timeout.
+.TP
+.B --tries N
+Read attempts, 1..8, default 2. Writes are never automatically repeated.
+.SH TUI KEYS
+1..6 or Tab select a page. Up/Down or j/k select a row. r refreshes. q quits.
+In DPI, e edits a slot. In Intervals, h changes the host parameter and s stores
+an experimental interval code. In Diagnostics, a chooses the dump address,
+p reads 128 bytes, x proposes a receiver reset. Every mutation needs y confirmation.
+.SH EXIT STATUS
+0 success (status may contain partial-read warnings); 1 operation failed;
+2 usage error; 130 SIGINT; 143 SIGTERM.
+.SH LIMITATIONS
+Only PID fa7b is allowed device configuration writes. Sibling PIDs are read-only.
+RGB, macros, button remapping, debounce and lift-off distance have no implemented
+protocol. No arbitrary memory-write command is exposed.
+The protocol has no sequence IDs; a delayed matching reply cannot be proved fresh.
+.SH PERMISSIONS
+Install udev/70-compx-mouse.rules before systemd's 73-seat-late.rules.
+For explicit receiver reset, the separate optional USB rule is needed.
+The C implementation requires physical-device acceptance testing before release.
