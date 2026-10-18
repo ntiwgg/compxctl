@@ -12,16 +12,16 @@ def main():
     import sys
     import termios
     import time
-    
+
     binary = os.path.abspath(sys.argv[1])
-    
+
     def start():
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 110, 0, 0))
         before = termios.tcgetattr(slave)
         p = subprocess.Popen([binary, 'tui', '--demo'], stdin=slave, stdout=slave, stderr=slave)
         return p, master, slave, before
-    
+
     def until(master, needle, timeout=5):
         data = b''
         deadline = time.monotonic()+timeout
@@ -36,7 +36,7 @@ def main():
                 data += chunk
                 if needle in data: return data
         raise AssertionError((needle, data[-4000:]))
-    
+
     p, master, slave, before = start()
     try:
         until(master, b'DEMO - NO HARDWARE')
@@ -70,7 +70,7 @@ def main():
     finally:
         if p.poll() is None: p.kill(); p.wait()
         os.close(master); os.close(slave)
-    
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         p, master, slave, before = start()
         try:
@@ -83,7 +83,7 @@ def main():
             if p.poll() is None: p.kill(); p.wait()
             os.close(master); os.close(slave)
     print('TUI: confirmed edit, cancellation, navigation, dump, resize, SIGINT/SIGTERM restoration OK')
-    
+
 
 if __name__ == '__main__':
     main()

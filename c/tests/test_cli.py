@@ -4,10 +4,10 @@ def main():
     import os
     import subprocess
     import sys
-    
+
     binary = os.path.abspath(sys.argv[1])
     checks = 0
-    
+
     def run(*args, code=0, demo=True):
         nonlocal checks
         p = subprocess.run([binary, *(['--demo'] if demo else []), *args], text=True,
@@ -16,7 +16,7 @@ def main():
         assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr
         checks += 1
         return p
-    
+
     assert '5.0.0-dev' in run('--version').stdout
     assert 'Commands:' in run('--help').stdout
     snapshot = json.loads(run('status', '--json').stdout)
@@ -53,7 +53,7 @@ def main():
     missing = json.loads(run('status','--device','__not_a_usb_port__','--json',demo=False,code=1).stdout)
     assert 'error' in missing
     print(f'CLI: {checks} black-box cases OK')
-    
+
 
 if __name__ == '__main__':
     main()
