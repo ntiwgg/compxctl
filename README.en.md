@@ -1,5 +1,7 @@
 # compxctl
 
+> **New standalone C CLI + TUI:** [c/README.md](c/README.md). Version 5.0.0-dev; physical-device acceptance is pending. The documentation below describes Python 4.4.0.
+
 **Polling rate and DPI for CompX / Ardor Gaming mice on Linux — without the
 proprietary Windows utility.**
 

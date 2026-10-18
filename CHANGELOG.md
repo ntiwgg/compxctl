@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] — C rewrite preview
+
+- Add an independent C17 implementation in `c/`: CLI, six-page ANSI TUI, explicit receiver selection, DPI editor, battery, host parameter, experimental stored interval code, config dump and explicit receiver reset.
+- Share operations between CLI and TUI; require explicit mutation confirmation, refuse unknown active DPI levels, restrict sibling PIDs to read-only and preserve uncertain-write results in schema-3 JSON.
+- Read the advertised interval and configured host parameter separately; never infer a measured/effective rate. Use correctly ordered and separately scoped udev rules.
+- Add strict compiler checks, protocol/operation tests, real-socket tests, black-box CLI tests, PTY interaction/restoration tests and ASan/UBSan CI.
+- This is a development preview, not a hardware-validated release. Python 4.4.0 remains available. Unknown RGB/button/macro protocols are not implemented; live packets are disabled on hardware.
+
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

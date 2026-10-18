@@ -1,0 +1,18 @@
+name: C CLI and TUI
+on:
+  push:
+  pull_request:
+jobs:
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strict C17, protocol, CLI and real PTY
+        run: make -C c test
+      - name: AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make -C c sanitize
+      - name: Install into staging directory
+        run: |
+          make -C c clean
+          make -C c install DESTDIR="$RUNNER_TEMP/compx-stage"
+          "$RUNNER_TEMP/compx-stage/usr/local/bin/compxctl" --version

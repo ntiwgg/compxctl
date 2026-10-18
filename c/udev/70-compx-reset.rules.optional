@@ -1,0 +1,3 @@
+# OPTIONAL: grants whole-receiver USB access, needed only for explicit reset.
+# Install as /etc/udev/rules.d/70-compx-reset.rules if reset is actually needed.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="25a7", ATTR{idProduct}=="fa7b|fa7c|fa03|fa93", TAG+="uaccess"
